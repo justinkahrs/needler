@@ -4,7 +4,7 @@ export type Stitch = {
   id: string;
   from: Hole;
   to: Hole;
-  colorId: string;
+  colorRoleId: string;
   thickness: number;
   strands?: number;
 };
@@ -26,11 +26,30 @@ export type SheetCanvas = {
   material: "perforated-paper";
 };
 
+export type ColorRole = {
+  id: string;
+  originalColorId: string;
+};
+
+export type Colorway = {
+  id: string;
+  name: string;
+  assignments: Record<string, string>;
+};
+
+export type ProjectColorState = {
+  roles: ColorRole[];
+  current: Record<string, string>;
+  colorways: Colorway[];
+  activeColorwayId?: string;
+};
+
 export type Project = {
-  version: 1;
+  version: 2;
   canvas: SheetCanvas;
   palette: PaletteColor[];
   stitches: Stitch[];
+  colors: ProjectColorState;
 };
 
 export type ReferenceTransform = {

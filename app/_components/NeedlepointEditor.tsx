@@ -12,6 +12,7 @@ import {
   Maximize2,
   Minus,
   Move,
+  Palette,
   PenLine,
   Pipette,
   Plus,
@@ -22,14 +23,24 @@ import {
   Undo2,
   X,
 } from "lucide-react";
+import ColorwayStudio from "@/app/_components/ColorwayStudio";
 import { DMC_COLORS } from "@/app/_data/dmcColors";
 import type { DmcColor } from "@/app/_data/dmcColors";
 import {
   LEGACY_PROJECT_STORAGE_KEY,
+  PREVIOUS_PROJECT_STORAGE_KEY,
   PROJECT_STORAGE_KEY,
   deserializeProject,
   serializeProject,
 } from "@/app/_lib/persistence";
+import {
+  addPaletteColors,
+  buildResolvedRolePalette,
+  ensureColorRole,
+  getUsedResolvedColors,
+  getUsedColorRoles,
+  makeEmptyColorState,
+} from "@/app/_lib/colorways";
 import type { PatternPdfProgress } from "@/app/_lib/patternPdf";
 import {
   MAX_HOLE_STRAND_UNITS,
@@ -73,6 +84,7 @@ type ReferenceImageState = {
   transform: ReferenceTransform;
 };
 type PreviewMode = "image" | "pattern" | "both";
+type RightPanelMode = "inspector" | "colorways";
 type DragState = { from: Hole; to: Hole | null } | null;
 type PanDragState =
   | {
@@ -167,6 +179,12 @@ function dmcColorId(floss: string) {
   return `dmc-${floss}`;
 }
 
+function uniqueEntityId(prefix: string) {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random()
+    .toString(36)
+    .slice(2, 7)}`;
+}
+
 function paletteColorFromDmc(color: DmcColor): PaletteColor {
   return {
     id: dmcColorId(color.floss),
@@ -202,10 +220,11 @@ function makeSheetCanvas(): Project["canvas"] {
 
 function makeDefaultProject(): Project {
   return {
-    version: 1,
+    version: 2,
     canvas: makeSheetCanvas(),
     palette: DEFAULT_PALETTE.map((color) => ({ ...color })),
     stitches: [],
+    colors: makeEmptyColorState(),
   };
 }
 
@@ -215,6 +234,10 @@ function getPaletteLabel(color: PaletteColor) {
 
 function normalizeProject(project: Project): Project {
   const paletteById = new Map<string, PaletteColor>();
+  const migrateColorId = (colorId: string) => {
+    const migratedDmc = LEGACY_COLOR_TO_DMC[colorId];
+    return migratedDmc ? dmcColorId(migratedDmc) : colorId;
+  };
 
   for (const color of project.palette) {
     const migratedDmc = LEGACY_COLOR_TO_DMC[color.id];
@@ -232,23 +255,40 @@ function normalizeProject(project: Project): Project {
   }
 
   const canvas = makeSheetCanvas();
+  const roles = project.colors.roles.map((role) => ({
+    ...role,
+    originalColorId: migrateColorId(role.originalColorId),
+  }));
+  const roleIds = new Set(roles.map((role) => role.id));
+  for (const stitch of project.stitches) {
+    if (!roleIds.has(stitch.colorRoleId)) {
+      roles.push({
+        id: stitch.colorRoleId,
+        originalColorId: migrateColorId(stitch.colorRoleId),
+      });
+      roleIds.add(stitch.colorRoleId);
+    }
+  }
+  const migrateAssignments = (assignments: Record<string, string>) =>
+    Object.fromEntries(
+      Object.entries(assignments).map(([roleId, colorId]) => [
+        roleId,
+        migrateColorId(colorId),
+      ]),
+    );
 
   return {
     ...project,
+    version: 2,
     canvas,
     palette: [...paletteById.values()],
     stitches: project.stitches
       .map((stitch) => {
-        const migratedDmc = LEGACY_COLOR_TO_DMC[stitch.colorId];
-        const nextColorId = migratedDmc
-          ? dmcColorId(migratedDmc)
-          : stitch.colorId;
         const nextStrands =
           stitch.strands ?? getLegacyStrandsFromThickness(stitch.thickness);
 
         return {
           ...stitch,
-          colorId: nextColorId,
           strands: nextStrands,
           thickness: getThreadWidthForStrands(nextStrands),
         };
@@ -258,6 +298,15 @@ function normalizeProject(project: Project): Project {
           isHoleWithinCanvas(stitch.from, canvas) &&
           isHoleWithinCanvas(stitch.to, canvas),
       ),
+    colors: {
+      roles,
+      current: migrateAssignments(project.colors.current),
+      colorways: project.colors.colorways.map((colorway) => ({
+        ...colorway,
+        assignments: migrateAssignments(colorway.assignments),
+      })),
+      activeColorwayId: project.colors.activeColorwayId,
+    },
   };
 }
 
@@ -495,13 +544,13 @@ function addHoleFill(
 
 function getHoleFillMap(
   project: Project,
-  paletteMap = buildPaletteMap(project.palette),
+  rolePalette = buildResolvedRolePalette(project),
 ) {
   const fillMap = new Map<string, HoleFill>();
 
   for (const stitch of project.stitches) {
     const strands = getStitchStrands(stitch);
-    const color = paletteMap.get(stitch.colorId)?.hex ?? project.palette[0]?.hex;
+    const color = rolePalette.get(stitch.colorRoleId)?.hex ?? project.palette[0]?.hex;
 
     if (!color) {
       continue;
@@ -884,27 +933,29 @@ function drawHoleThreadFill(
 
 type DenseStitchGroup = {
   path: Path2D;
-  color: string;
+  colorRoleId: string;
   width: number;
 };
 
-const denseStitchCache = new WeakMap<Project, DenseStitchGroup[]>();
+const denseStitchCache = new WeakMap<Stitch[], DenseStitchGroup[]>();
 const denseHoleFillCache = new WeakMap<Project, Map<string, HoleFill>>();
+const previewHoleFillCache = new WeakMap<object, Map<string, HoleFill>>();
 const draftPathCache = new WeakMap<PatternDraft, DenseStitchGroup[]>();
 
 function getDenseStitchGroups(project: Project) {
-  const cached = denseStitchCache.get(project);
+  const cached = denseStitchCache.get(project.stitches);
   if (cached) return cached;
 
-  const paletteMap = buildPaletteMap(project.palette);
   const groups = new Map<string, DenseStitchGroup>();
 
   for (const stitch of project.stitches) {
-    const color = paletteMap.get(stitch.colorId)?.hex ?? project.palette[0]?.hex;
-    if (!color) continue;
     const width = getStitchWidth(stitch);
-    const key = `${color}:${width.toFixed(2)}`;
-    const group = groups.get(key) ?? { path: new Path2D(), color, width };
+    const key = `${stitch.colorRoleId}:${width.toFixed(2)}`;
+    const group = groups.get(key) ?? {
+      path: new Path2D(),
+      colorRoleId: stitch.colorRoleId,
+      width,
+    };
     const start = holeToWorld(stitch.from, project.canvas);
     const end = holeToWorld(stitch.to, project.canvas);
     group.path.moveTo(start.x, start.y);
@@ -913,27 +964,34 @@ function getDenseStitchGroups(project: Project) {
   }
 
   const result = [...groups.values()];
-  denseStitchCache.set(project, result);
+  denseStitchCache.set(project.stitches, result);
   return result;
 }
 
-function drawDenseStitches(ctx: CanvasRenderingContext2D, project: Project) {
+function drawDenseStitches(
+  ctx: CanvasRenderingContext2D,
+  project: Project,
+  assignments?: Record<string, string>,
+) {
   const groups = getDenseStitchGroups(project);
+  const rolePalette = buildResolvedRolePalette(project, assignments);
 
   ctx.save();
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
   for (const group of groups) {
+    const color = rolePalette.get(group.colorRoleId)?.hex ?? project.palette[0]?.hex;
+    if (!color) continue;
     ctx.save();
     ctx.shadowColor = "rgba(56, 33, 21, 0.2)";
     ctx.shadowBlur = 2;
     ctx.shadowOffsetY = 1.1;
-    ctx.strokeStyle = rgba(group.color, 0.42);
+    ctx.strokeStyle = rgba(color, 0.42);
     ctx.lineWidth = group.width + 2.2;
     ctx.stroke(group.path);
     ctx.restore();
 
-    ctx.strokeStyle = group.color;
+    ctx.strokeStyle = color;
     ctx.lineWidth = group.width;
     ctx.stroke(group.path);
     ctx.strokeStyle = "rgba(255, 255, 255, 0.2)";
@@ -942,29 +1000,36 @@ function drawDenseStitches(ctx: CanvasRenderingContext2D, project: Project) {
   }
   ctx.restore();
 
-  const fillMap =
-    denseHoleFillCache.get(project) ?? getHoleFillMap(project, buildPaletteMap(project.palette));
-  denseHoleFillCache.set(project, fillMap);
+  const previewKey = assignments as object | undefined;
+  const fillMap = assignments
+    ? previewHoleFillCache.get(previewKey!) ?? getHoleFillMap(project, rolePalette)
+    : denseHoleFillCache.get(project) ?? getHoleFillMap(project, rolePalette);
+  if (assignments) previewHoleFillCache.set(previewKey!, fillMap);
+  else denseHoleFillCache.set(project, fillMap);
   drawHoleThreadFill(ctx, project, fillMap);
 }
 
-function drawStitches(ctx: CanvasRenderingContext2D, project: Project) {
+function drawStitches(
+  ctx: CanvasRenderingContext2D,
+  project: Project,
+  assignments?: Record<string, string>,
+) {
   if (project.stitches.length > 1200) {
-    drawDenseStitches(ctx, project);
+    drawDenseStitches(ctx, project, assignments);
     return;
   }
 
-  const paletteMap = buildPaletteMap(project.palette);
+  const rolePalette = buildResolvedRolePalette(project, assignments);
 
   for (const stitch of project.stitches) {
-    const color = paletteMap.get(stitch.colorId)?.hex ?? project.palette[0]?.hex;
+    const color = rolePalette.get(stitch.colorRoleId)?.hex ?? project.palette[0]?.hex;
 
     if (color) {
       drawThreadStitch(ctx, stitch, color, project.canvas);
     }
   }
 
-  drawHoleThreadFill(ctx, project, getHoleFillMap(project, paletteMap));
+  drawHoleThreadFill(ctx, project, getHoleFillMap(project, rolePalette));
 }
 
 function getPatternStitchHoles(
@@ -988,7 +1053,7 @@ function getDraftGroups(draft: PatternDraft, canvas: Project["canvas"]) {
   if (cached) return cached;
   const groups = draft.colors.map((usage) => ({
     path: new Path2D(),
-    color: usage.color.hex,
+    colorRoleId: usage.color.id,
     width: getThreadWidthForStrands(draft.settings.strands),
   }));
 
@@ -1019,16 +1084,20 @@ function drawPatternDraft(
   ctx.globalAlpha = 0.9;
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
-  for (const group of getDraftGroups(draft, canvas)) {
+  const groups = getDraftGroups(draft, canvas);
+  for (let index = 0; index < groups.length; index += 1) {
+    const group = groups[index];
+    const color = draft.colors[index]?.color.hex;
+    if (!color) continue;
     ctx.save();
     ctx.shadowColor = "rgba(56, 33, 21, 0.2)";
     ctx.shadowBlur = 2;
     ctx.shadowOffsetY = 1.1;
-    ctx.strokeStyle = rgba(group.color, 0.38);
+    ctx.strokeStyle = rgba(color, 0.38);
     ctx.lineWidth = group.width + 2.1;
     ctx.stroke(group.path);
     ctx.restore();
-    ctx.strokeStyle = group.color;
+    ctx.strokeStyle = color;
     ctx.lineWidth = group.width;
     ctx.stroke(group.path);
     ctx.strokeStyle = "rgba(255, 255, 255, 0.2)";
@@ -1141,14 +1210,14 @@ function findNearestStitch(
   return nearest?.stitch ?? null;
 }
 
-function makeStitch(from: Hole, to: Hole, colorId: string, strands: number) {
+function makeStitch(from: Hole, to: Hole, colorRoleId: string, strands: number) {
   return {
     id: `stitch-${Date.now().toString(36)}-${Math.random()
       .toString(36)
       .slice(2, 8)}`,
     from,
     to,
-    colorId,
+    colorRoleId,
     thickness: getThreadWidthForStrands(strands),
     strands,
   };
@@ -1184,7 +1253,9 @@ function applyPatternDraft(
       : [],
   );
   const loadMap = mode === "replace" ? new Map<string, number>() : getHoleLoadMap(project);
-  const additions: Stitch[] = [];
+  const pendingAdditions: Array<
+    Omit<Stitch, "colorRoleId"> & { physicalColorId: string }
+  > = [];
   const usedColorIds = new Set<string>();
   let occupiedSkipped = 0;
   let capacitySkipped = 0;
@@ -1217,11 +1288,11 @@ function applyPatternDraft(
       continue;
     }
 
-    additions.push({
+    pendingAdditions.push({
       id: `image-${batchId}-${index.toString(36)}`,
       from: holes.from,
       to: holes.to,
-      colorId: color.id,
+      physicalColorId: color.id,
       strands: draft.settings.strands,
       thickness: getThreadWidthForStrands(draft.settings.strands),
     });
@@ -1235,11 +1306,31 @@ function applyPatternDraft(
   const addedColors = draft.colors
     .map((usage) => usage.color)
     .filter((color) => usedColorIds.has(color.id) && !paletteIds.has(color.id));
+  let nextProject = addPaletteColors(project, addedColors);
+  const roleByColor = new Map<string, string>();
+  for (const colorId of usedColorIds) {
+    const ensured = ensureColorRole(nextProject, colorId);
+    nextProject = ensured.project;
+    roleByColor.set(colorId, ensured.roleId);
+  }
+  const additions: Stitch[] = pendingAdditions.flatMap((stitch) => {
+    const colorRoleId = roleByColor.get(stitch.physicalColorId);
+    if (!colorRoleId) return [];
+    return [
+      {
+        id: stitch.id,
+        from: stitch.from,
+        to: stitch.to,
+        strands: stitch.strands,
+        thickness: stitch.thickness,
+        colorRoleId,
+      },
+    ];
+  });
 
   return {
     project: {
-      ...project,
-      palette: [...project.palette, ...addedColors],
+      ...nextProject,
       stitches: [...baseStitches, ...additions],
     },
     additions: additions.length,
@@ -1433,6 +1524,15 @@ export default function NeedlepointEditor() {
   const [replaceConfirmed, setReplaceConfirmed] = useState(false);
   const [paperSize, setPaperSize] = useState<PatternPaperSize>("letter");
   const [pdfJob, setPdfJob] = useState<PdfJobState>({ status: "idle" });
+  const [rightPanelMode, setRightPanelMode] =
+    useState<RightPanelMode>("inspector");
+  const [initialColorwayRoleId, setInitialColorwayRoleId] = useState<
+    string | undefined
+  >();
+  const [colorwayPreview, setColorwayPreview] = useState<Record<
+    string,
+    string
+  > | null>(null);
 
   const stageRef = useRef<HTMLDivElement | null>(null);
   const baseCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -1480,10 +1580,57 @@ export default function NeedlepointEditor() {
 
     return matches.slice(0, 36);
   }, [dmcQuery]);
+  const usedColorRoles = useMemo(() => getUsedColorRoles(project), [project]);
+  const usedResolvedColors = useMemo(
+    () => getUsedResolvedColors(project),
+    [project],
+  );
+  const threadSwatchColors = useMemo(
+    () =>
+      usedResolvedColors.length > 0
+        ? usedResolvedColors.map((usage) => usage.color)
+        : project.palette,
+    [project.palette, usedResolvedColors],
+  );
+  const activeColorwayName =
+    project.colors.colorways.find(
+      (colorway) => colorway.id === project.colors.activeColorwayId,
+    )?.name ??
+    (Object.keys(project.colors.current).length > 0 ? "Modified" : "Original");
 
   const notify = useCallback((message: string, tone: NoticeTone = "info") => {
     setNotice({ id: Date.now(), message, tone });
   }, []);
+
+  const handleColorwayPreview = useCallback(
+    (assignments: Record<string, string> | null) => {
+      setColorwayPreview(assignments);
+    },
+    [],
+  );
+
+  const openColorwayStudio = (roleId?: string) => {
+    if (patternDraft) {
+      notify("Apply or clear the image preview before editing colorways.", "warn");
+      return;
+    }
+    setInitialColorwayRoleId(roleId);
+    setRightPanelMode("colorways");
+  };
+
+  const closeColorwayStudio = () => {
+    setColorwayPreview(null);
+    setInitialColorwayRoleId(undefined);
+    setRightPanelMode("inspector");
+  };
+
+  const commitColorwayProject = (nextProject: Project, message: string) => {
+    commitProject(nextProject);
+    const nextUsed = getUsedResolvedColors(nextProject);
+    if (nextUsed[0]) setSelectedColorId(nextUsed[0].color.id);
+    closeColorwayStudio();
+    notify(message, "success");
+  };
 
   const fitViewToCanvas = useCallback((canvas: Project["canvas"], rotation?: number) => {
     setView((current) => {
@@ -1538,7 +1685,11 @@ export default function NeedlepointEditor() {
     let loadedProject: Project | null = null;
 
     try {
-      for (const key of [PROJECT_STORAGE_KEY, LEGACY_PROJECT_STORAGE_KEY]) {
+      for (const key of [
+        PROJECT_STORAGE_KEY,
+        PREVIOUS_PROJECT_STORAGE_KEY,
+        LEGACY_PROJECT_STORAGE_KEY,
+      ]) {
         const savedProject = window.localStorage.getItem(key);
         if (!savedProject) continue;
         loadedProject = deserializeProject(JSON.parse(savedProject) as unknown);
@@ -1694,10 +1845,10 @@ export default function NeedlepointEditor() {
     ctx.save();
     applyViewTransform(ctx, view, project.canvas);
     if (!patternDraft) {
-      drawStitches(ctx, project);
+      drawStitches(ctx, project, colorwayPreview ?? undefined);
     }
     ctx.restore();
-  }, [patternDraft, project, view, viewport]);
+  }, [colorwayPreview, patternDraft, project, view, viewport]);
 
   useEffect(() => {
     const ctx = prepareCanvas(previewCanvasRef.current, viewport);
@@ -1743,7 +1894,7 @@ export default function NeedlepointEditor() {
           id: "preview-stitch",
           from: drag.from,
           to: drag.to,
-          colorId: activeColorId,
+          colorRoleId: "preview-color",
           thickness: strandWidth,
           strands: strandCount,
         },
@@ -1819,11 +1970,15 @@ export default function NeedlepointEditor() {
 
       if (modKey && event.key.toLowerCase() === "z") {
         event.preventDefault();
+        setColorwayPreview(null);
+        setRightPanelMode("inspector");
         dispatch({ type: event.shiftKey ? "redo" : "undo" });
       }
 
       if (modKey && event.key.toLowerCase() === "y") {
         event.preventDefault();
+        setColorwayPreview(null);
+        setRightPanelMode("inspector");
         dispatch({ type: "redo" });
       }
 
@@ -1831,6 +1986,8 @@ export default function NeedlepointEditor() {
         setDrag(null);
         setPanDrag(null);
         setImageDrag(null);
+        setColorwayPreview(null);
+        setRightPanelMode("inspector");
       }
     };
 
@@ -2019,11 +2176,12 @@ export default function NeedlepointEditor() {
       return;
     }
 
+    const ensured = ensureColorRole(project, activeColorId);
     commitProject({
-      ...project,
+      ...ensured.project,
       stitches: [
         ...project.stitches,
-        makeStitch(drag.from, destination, activeColorId, strandCount),
+        makeStitch(drag.from, destination, ensured.roleId, strandCount),
       ],
     });
   };
@@ -2077,7 +2235,7 @@ export default function NeedlepointEditor() {
 
   const addCustomColor = () => {
     const trimmedName = customName.trim() || "Custom thread";
-    const id = `thread-${Date.now().toString(36)}`;
+    const id = uniqueEntityId("thread");
     const nextProject = {
       ...project,
       palette: [
@@ -2094,6 +2252,7 @@ export default function NeedlepointEditor() {
   const resetProject = () => {
     const nextProject = makeDefaultProject();
 
+    closeColorwayStudio();
     commitProject(nextProject);
     setPatternDraft(null);
     setReplaceConfirmed(false);
@@ -2479,14 +2638,20 @@ export default function NeedlepointEditor() {
           <IconButton
             label="Undo"
             disabled={state.past.length === 0}
-            onClick={() => dispatch({ type: "undo" })}
+            onClick={() => {
+              closeColorwayStudio();
+              dispatch({ type: "undo" });
+            }}
           >
             <Undo2 size={18} strokeWidth={1.8} />
           </IconButton>
           <IconButton
             label="Redo"
             disabled={state.future.length === 0}
-            onClick={() => dispatch({ type: "redo" })}
+            onClick={() => {
+              closeColorwayStudio();
+              dispatch({ type: "redo" });
+            }}
           >
             <Redo2 size={18} strokeWidth={1.8} />
           </IconButton>
@@ -2602,6 +2767,15 @@ export default function NeedlepointEditor() {
           </div>
         </section>
 
+        {rightPanelMode === "colorways" ? (
+          <ColorwayStudio
+            project={project}
+            initialRoleId={initialColorwayRoleId}
+            onPreview={handleColorwayPreview}
+            onCommit={commitColorwayProject}
+            onClose={closeColorwayStudio}
+          />
+        ) : (
         <aside className="order-3 flex flex-col gap-4 rounded-lg border border-[#d6bfa6] bg-[#fff8ef] p-4 shadow-[0_20px_44px_-30px_rgba(87,55,35,0.32)] lg:max-h-[calc(100dvh-2rem)] lg:overflow-auto">
           <section>
             <div className="flex items-start justify-between gap-3">
@@ -2625,7 +2799,7 @@ export default function NeedlepointEditor() {
             </div>
 
             <div className="mt-4 grid grid-cols-7 gap-2">
-              {project.palette.map((color) => (
+              {threadSwatchColors.map((color) => (
                 <button
                   key={color.id}
                   type="button"
@@ -2642,6 +2816,66 @@ export default function NeedlepointEditor() {
                 />
               ))}
             </div>
+
+            <button
+              type="button"
+              className={`${panelButtonClass("solid")} mt-3 w-full`}
+              disabled={project.stitches.length === 0 || Boolean(patternDraft)}
+              onClick={() => openColorwayStudio()}
+            >
+              <Palette size={16} strokeWidth={1.8} />
+              Edit colorways
+              <span className="ml-auto max-w-24 truncate font-mono text-[10px] uppercase opacity-75">
+                {activeColorwayName}
+              </span>
+            </button>
+
+            {usedColorRoles.length > 0 ? (
+              <div className="mt-3 divide-y divide-[#ead9c7] border-y border-[#ead9c7]">
+                {usedColorRoles.map((usage) => (
+                  <div
+                    key={usage.role.id}
+                    className="grid grid-cols-[minmax(0,1fr)_38px] items-stretch bg-white/55"
+                  >
+                    <button
+                      type="button"
+                      className="grid min-w-0 grid-cols-[24px_minmax(0,1fr)] items-center gap-2 px-2 py-2 text-left"
+                      onClick={() => setSelectedColorId(usage.current.id)}
+                    >
+                      <span
+                        className="h-6 w-6 rounded border border-[#cdb39a]"
+                        style={{ backgroundColor: usage.original.hex }}
+                      />
+                      <span className="min-w-0">
+                        <span className="block truncate text-xs font-medium text-[#3d2b1f]">
+                          {usage.original.floss
+                            ? `DMC ${usage.original.floss}`
+                            : usage.original.name}
+                        </span>
+                        <span className="block truncate font-mono text-[10px] text-[#8a6c55]">
+                          {usage.current.id === usage.original.id
+                            ? `${usage.count.toLocaleString()} stitches`
+                            : `${usage.count.toLocaleString()} to ${
+                                usage.current.floss
+                                  ? `DMC ${usage.current.floss}`
+                                  : usage.current.name
+                              }`}
+                        </span>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`Replace ${getPaletteLabel(usage.original)} throughout`}
+                      title="Replace throughout"
+                      className="flex items-center justify-center border-l border-[#ead9c7] text-[#765943] transition hover:bg-[#fff2df] hover:text-[#4f392b]"
+                      onClick={() => openColorwayStudio(usage.role.id)}
+                    >
+                      <Palette size={15} strokeWidth={1.8} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : null}
           </section>
 
           <section className="border-t border-[#e4d2bf] pt-4">
@@ -3305,12 +3539,13 @@ export default function NeedlepointEditor() {
                   Colors
                 </dt>
                 <dd className="mt-1 font-mono text-lg text-[#38271d]">
-                  {project.palette.length}
+                  {usedResolvedColors.length}
                 </dd>
               </div>
             </dl>
           </section>
         </aside>
+        )}
       </div>
     </main>
   );

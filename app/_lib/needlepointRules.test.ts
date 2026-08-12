@@ -11,12 +11,12 @@ function projectWithSharedHole(strands: number, count: number): Project {
     id: `stitch-${index}`,
     from: { col: 20, row: 20 },
     to: { col: 21 + index, row: 21 },
-    colorId: "dmc-321",
+    colorRoleId: "role-red",
     strands,
     thickness: 10,
   }));
   return {
-    version: 1,
+    version: 2,
     canvas: {
       cols: 127,
       rows: 169,
@@ -27,6 +27,11 @@ function projectWithSharedHole(strands: number, count: number): Project {
     },
     palette: [{ id: "dmc-321", name: "Red", hex: "#c72b3b" }],
     stitches,
+    colors: {
+      roles: [{ id: "role-red", originalColorId: "dmc-321" }],
+      current: {},
+      colorways: [],
+    },
   };
 }
 

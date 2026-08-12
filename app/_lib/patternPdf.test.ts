@@ -5,7 +5,7 @@ import type { Project } from "./needlepointTypes";
 
 function makeProject(freeform = false): Project {
   return {
-    version: 1,
+    version: 2,
     canvas: {
       cols: 127,
       rows: 169,
@@ -28,7 +28,7 @@ function makeProject(freeform = false): Project {
         id: "tent",
         from: { col: 0, row: 1 },
         to: { col: 1, row: 0 },
-        colorId: "dmc-321",
+        colorRoleId: "role-red",
         thickness: 12,
         strands: 6,
       },
@@ -38,13 +38,18 @@ function makeProject(freeform = false): Project {
               id: "freeform",
               from: { col: 2, row: 3 },
               to: { col: 18, row: 24 },
-              colorId: "dmc-321",
+              colorRoleId: "role-red",
               thickness: 12,
               strands: 6,
             },
           ]
         : []),
     ],
+    colors: {
+      roles: [{ id: "role-red", originalColorId: "dmc-321" }],
+      current: {},
+      colorways: [],
+    },
   };
 }
 

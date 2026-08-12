@@ -11,6 +11,7 @@ import type {
   Project,
   Stitch,
 } from "@/app/_lib/needlepointTypes";
+import { resolveRoleColorId } from "@/app/_lib/colorways";
 
 export type PatternPdfProgress = {
   stage: "preparing" | "cover" | "legend" | "charts" | "exceptions" | "saving";
@@ -24,7 +25,7 @@ type ChartCell = {
   passes: number;
 };
 
-type ExceptionStitch = { label: string; stitch: Stitch };
+type ExceptionStitch = { label: string; stitch: Stitch; colorId: string };
 
 type ChartData = {
   cells: Map<string, ChartCell>;
@@ -75,19 +76,23 @@ function unitCellForStitch(stitch: Stitch) {
 }
 
 function buildChartData(project: Project): ChartData {
-  const buckets = new Map<string, Array<{ stitch: Stitch; direction: string }>>();
+  const buckets = new Map<
+    string,
+    Array<{ stitch: Stitch; direction: string; colorId: string }>
+  >();
   const exceptions: ExceptionStitch[] = [];
 
   for (const stitch of project.stitches) {
     const unitCell = unitCellForStitch(stitch);
+    const colorId = resolveRoleColorId(project, stitch.colorRoleId);
     if (!unitCell) {
-      exceptions.push({ label: "", stitch });
+      exceptions.push({ label: "", stitch, colorId });
       continue;
     }
 
     const key = `${unitCell.col}:${unitCell.row}`;
     const bucket = buckets.get(key) ?? [];
-    bucket.push({ stitch, direction: unitCell.direction });
+    bucket.push({ stitch, direction: unitCell.direction, colorId });
     buckets.set(key, bucket);
   }
 
@@ -97,13 +102,15 @@ function buildChartData(project: Project): ChartData {
     const first = bucket[0];
     const isSimple = bucket.every(
       (entry) =>
-        entry.stitch.colorId === first.stitch.colorId &&
+        entry.colorId === first.colorId &&
         entry.direction === first.direction &&
         getStitchStrands(entry.stitch) === getStitchStrands(first.stitch),
     );
 
     if (!isSimple) {
-      for (const entry of bucket) exceptions.push({ label: "", stitch: entry.stitch });
+      for (const entry of bucket) {
+        exceptions.push({ label: "", stitch: entry.stitch, colorId: entry.colorId });
+      }
       continue;
     }
 
@@ -111,7 +118,7 @@ function buildChartData(project: Project): ChartData {
     cells.set(key, {
       col,
       row,
-      colorId: first.stitch.colorId,
+      colorId: first.colorId,
       passes: bucket.length,
     });
   }
@@ -133,7 +140,7 @@ function getUsedColors(project: Project) {
   >();
 
   for (const stitch of project.stitches) {
-    const color = paletteMap.get(stitch.colorId);
+    const color = paletteMap.get(resolveRoleColorId(project, stitch.colorRoleId));
     if (!color) continue;
     const current = usage.get(color.id) ?? {
       color,
@@ -621,7 +628,7 @@ function drawExceptionPages(
     currentPage.drawText(
       `(${stitch.from.col}, ${stitch.from.row}) to (${stitch.to.col}, ${
         stitch.to.row
-      }) | ${stitch.colorId.replace("dmc-", "DMC ")} | ${getStitchStrands(
+      }) | ${exception.colorId.replace("dmc-", "DMC ")} | ${getStitchStrands(
         stitch,
       )} strands`,
       {
