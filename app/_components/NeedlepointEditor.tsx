@@ -45,7 +45,14 @@ type PaletteColor = {
 };
 type Project = {
   version: 1;
-  canvas: { cols: number; rows: number; meshCount?: number };
+  canvas: {
+    cols: number;
+    rows: number;
+    meshCount: number;
+    widthIn: number;
+    heightIn: number;
+    material: "perforated-paper";
+  };
   palette: PaletteColor[];
   stitches: Stitch[];
 };
@@ -70,6 +77,25 @@ type PanDragState =
   | null;
 type NoticeTone = "info" | "warn" | "success";
 type Notice = { id: number; message: string; tone: NoticeTone };
+type HoleFill = {
+  load: number;
+  red: number;
+  green: number;
+  blue: number;
+};
+type HoleCapacityCheck =
+  | {
+      canAdd: true;
+      fromLoad: number;
+      toLoad: number;
+    }
+  | {
+      canAdd: false;
+      fromLoad: number;
+      toLoad: number;
+      blockedHole: Hole;
+      blockedLoad: number;
+    };
 
 type EditorState = {
   project: Project;
@@ -86,12 +112,16 @@ type EditorAction =
 
 const STORAGE_KEY = "needler.project.v1";
 const MAX_HISTORY = 100;
-const DEFAULT_MESH_COUNT = 14;
+const SHEET_WIDTH_IN = 9;
+const SHEET_HEIGHT_IN = 12;
+const SHEET_MESH_COUNT = 14;
+const SHEET_COLS = SHEET_WIDTH_IN * SHEET_MESH_COUNT + 1;
+const SHEET_ROWS = SHEET_HEIGHT_IN * SHEET_MESH_COUNT + 1;
+const MAX_HOLE_STRAND_UNITS = 18;
 const DEFAULT_STRAND_COUNT = 6;
 const DISPLAY_PIXELS_PER_INCH = 252;
 const DMC_STRAND_DIAMETER_INCH = 0.0265;
-const MESH_OPTIONS = [7, 10, 14, 18];
-const MIN_ZOOM = 0.32;
+const MIN_ZOOM = 0.12;
 const MAX_ZOOM = 2.7;
 const EXPORT_SCALE = 3;
 
@@ -146,10 +176,21 @@ const DEFAULT_PALETTE: PaletteColor[] = DEFAULT_DMC_FLOSS.map(
 
 const INITIAL_SELECTED_COLOR_ID = DEFAULT_PALETTE[0].id;
 
+function makeSheetCanvas(): Project["canvas"] {
+  return {
+    cols: SHEET_COLS,
+    rows: SHEET_ROWS,
+    meshCount: SHEET_MESH_COUNT,
+    widthIn: SHEET_WIDTH_IN,
+    heightIn: SHEET_HEIGHT_IN,
+    material: "perforated-paper",
+  };
+}
+
 function makeDefaultProject(): Project {
   return {
     version: 1,
-    canvas: { cols: 48, rows: 64, meshCount: DEFAULT_MESH_COUNT },
+    canvas: makeSheetCanvas(),
     palette: DEFAULT_PALETTE.map((color) => ({ ...color })),
     stitches: [],
   };
@@ -177,26 +218,33 @@ function normalizeProject(project: Project): Project {
     }
   }
 
+  const canvas = makeSheetCanvas();
+
   return {
     ...project,
-    canvas: {
-      ...project.canvas,
-      meshCount: getMeshCount(project.canvas),
-    },
+    canvas,
     palette: [...paletteById.values()],
-    stitches: project.stitches.map((stitch) => {
-      const migratedDmc = LEGACY_COLOR_TO_DMC[stitch.colorId];
-      const nextColorId = migratedDmc ? dmcColorId(migratedDmc) : stitch.colorId;
-      const nextStrands =
-        stitch.strands ?? getLegacyStrandsFromThickness(stitch.thickness);
+    stitches: project.stitches
+      .map((stitch) => {
+        const migratedDmc = LEGACY_COLOR_TO_DMC[stitch.colorId];
+        const nextColorId = migratedDmc
+          ? dmcColorId(migratedDmc)
+          : stitch.colorId;
+        const nextStrands =
+          stitch.strands ?? getLegacyStrandsFromThickness(stitch.thickness);
 
-      return {
-        ...stitch,
-        colorId: nextColorId,
-        strands: nextStrands,
-        thickness: getThreadWidthForStrands(nextStrands),
-      };
-    }),
+        return {
+          ...stitch,
+          colorId: nextColorId,
+          strands: nextStrands,
+          thickness: getThreadWidthForStrands(nextStrands),
+        };
+      })
+      .filter(
+        (stitch) =>
+          isHoleWithinCanvas(stitch.from, canvas) &&
+          isHoleWithinCanvas(stitch.to, canvas),
+      ),
   };
 }
 
@@ -248,7 +296,7 @@ function editorReducer(state: EditorState, action: EditorAction): EditorState {
 }
 
 function getMeshCount(canvas: Project["canvas"]) {
-  return canvas.meshCount ?? DEFAULT_MESH_COUNT;
+  return canvas.meshCount ?? SHEET_MESH_COUNT;
 }
 
 function getGridSpacing(canvas: Project["canvas"]) {
@@ -284,6 +332,10 @@ function getStitchWidth(stitch: Stitch) {
   return stitch.strands
     ? getThreadWidthForStrands(stitch.strands)
     : stitch.thickness;
+}
+
+function getStitchStrands(stitch: Stitch) {
+  return stitch.strands ?? getLegacyStrandsFromThickness(stitch.thickness);
 }
 
 function getWorldSize(canvas: Project["canvas"]) {
@@ -397,8 +449,121 @@ function nearestHole(point: Point, canvas: Project["canvas"]): Hole | null {
   return distance <= spacing * 0.78 ? { col, row } : null;
 }
 
+function isHoleWithinCanvas(hole: Hole, canvas: Project["canvas"]) {
+  return (
+    hole.col >= 0 &&
+    hole.row >= 0 &&
+    hole.col < canvas.cols &&
+    hole.row < canvas.rows
+  );
+}
+
 function sameHole(a: Hole | null, b: Hole | null) {
   return Boolean(a && b && a.col === b.col && a.row === b.row);
+}
+
+function holeKey(hole: Hole) {
+  return `${hole.col}:${hole.row}`;
+}
+
+function getHoleLoad(loadMap: Map<string, number>, hole: Hole) {
+  return loadMap.get(holeKey(hole)) ?? 0;
+}
+
+function getHoleLoadMap(project: Project) {
+  const loadMap = new Map<string, number>();
+
+  for (const stitch of project.stitches) {
+    const strands = getStitchStrands(stitch);
+
+    for (const hole of [stitch.from, stitch.to]) {
+      const key = holeKey(hole);
+      loadMap.set(key, (loadMap.get(key) ?? 0) + strands);
+    }
+  }
+
+  return loadMap;
+}
+
+function addHoleFill(
+  fillMap: Map<string, HoleFill>,
+  hole: Hole,
+  strands: number,
+  color: string,
+) {
+  const key = holeKey(hole);
+  const rgb = hexToRgb(color);
+  const current = fillMap.get(key) ?? { load: 0, red: 0, green: 0, blue: 0 };
+
+  fillMap.set(key, {
+    load: current.load + strands,
+    red: current.red + rgb.r * strands,
+    green: current.green + rgb.g * strands,
+    blue: current.blue + rgb.b * strands,
+  });
+}
+
+function getHoleFillMap(
+  project: Project,
+  paletteMap = buildPaletteMap(project.palette),
+) {
+  const fillMap = new Map<string, HoleFill>();
+
+  for (const stitch of project.stitches) {
+    const strands = getStitchStrands(stitch);
+    const color = paletteMap.get(stitch.colorId)?.hex ?? project.palette[0]?.hex;
+
+    if (!color) {
+      continue;
+    }
+
+    addHoleFill(fillMap, stitch.from, strands, color);
+    addHoleFill(fillMap, stitch.to, strands, color);
+  }
+
+  return fillMap;
+}
+
+function canAddStitchWithLoadMap(
+  loadMap: Map<string, number>,
+  from: Hole,
+  to: Hole,
+  strands: number,
+): HoleCapacityCheck {
+  const strandUnits = clamp(Math.round(strands), 1, 8);
+  const fromLoad = getHoleLoad(loadMap, from);
+  const toLoad = getHoleLoad(loadMap, to);
+
+  if (fromLoad + strandUnits > MAX_HOLE_STRAND_UNITS) {
+    return {
+      canAdd: false,
+      fromLoad,
+      toLoad,
+      blockedHole: from,
+      blockedLoad: fromLoad,
+    };
+  }
+
+  if (toLoad + strandUnits > MAX_HOLE_STRAND_UNITS) {
+    return {
+      canAdd: false,
+      fromLoad,
+      toLoad,
+      blockedHole: to,
+      blockedLoad: toLoad,
+    };
+  }
+
+  return { canAdd: true, fromLoad, toLoad };
+}
+
+function canAddStitch(
+  project: Project,
+  from: Hole,
+  to: Hole,
+  strands: number,
+) {
+  return canAddStitchWithLoadMap(getHoleLoadMap(project), from, to, strands);
 }
 
 function getClientPoint(
@@ -550,7 +715,7 @@ function drawReferenceImage(
   ctx.restore();
 }
 
-function drawPlasticCanvas(
+function drawPerforatedSheet(
   ctx: CanvasRenderingContext2D,
   project: Project,
   referenceImage?: { image: HTMLImageElement; opacity: number } | null,
@@ -628,9 +793,22 @@ function drawThreadStitch(
   const dx = end.x - start.x;
   const dy = end.y - start.y;
   const length = Math.max(1, Math.hypot(dx, dy));
+  const direction = { x: dx / length, y: dy / length };
   const normal = { x: -dy / length, y: dx / length };
-  const middle = { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
   const threadWidth = getStitchWidth(stitch);
+  const capExtension = Math.min(getHoleRadius(canvas) * 0.68, threadWidth * 0.2);
+  const renderStart = {
+    x: start.x - direction.x * capExtension,
+    y: start.y - direction.y * capExtension,
+  };
+  const renderEnd = {
+    x: end.x + direction.x * capExtension,
+    y: end.y + direction.y * capExtension,
+  };
+  const middle = {
+    x: (renderStart.x + renderEnd.x) / 2,
+    y: (renderStart.y + renderEnd.y) / 2,
+  };
   const ridgeCount = clamp(Math.round((stitch.strands ?? 6) + 1), 4, 10);
   const baseWidth = Math.max(1.45, threadWidth / ridgeCount);
   const seed = hashString(stitch.id);
@@ -645,8 +823,8 @@ function drawThreadStitch(
   ctx.strokeStyle = rgba(color, 0.42);
   ctx.lineWidth = threadWidth + 2.4;
   ctx.beginPath();
-  ctx.moveTo(start.x, start.y);
-  ctx.lineTo(end.x, end.y);
+  ctx.moveTo(renderStart.x, renderStart.y);
+  ctx.lineTo(renderEnd.x, renderEnd.y);
   ctx.stroke();
   ctx.restore();
 
@@ -665,12 +843,12 @@ function drawThreadStitch(
     ctx.strokeStyle = shade;
     ctx.lineWidth = baseWidth * 1.18;
     ctx.beginPath();
-    ctx.moveTo(start.x + normal.x * offset, start.y + normal.y * offset);
+    ctx.moveTo(renderStart.x + normal.x * offset, renderStart.y + normal.y * offset);
     ctx.quadraticCurveTo(
       middle.x + normal.x * (offset + curve),
       middle.y + normal.y * (offset + curve),
-      end.x + normal.x * offset,
-      end.y + normal.y * offset,
+      renderEnd.x + normal.x * offset,
+      renderEnd.y + normal.y * offset,
     );
     ctx.stroke();
   }
@@ -679,10 +857,58 @@ function drawThreadStitch(
   ctx.strokeStyle = "rgba(255, 255, 255, 0.72)";
   ctx.lineWidth = 0.9;
   ctx.beginPath();
-  ctx.moveTo(start.x + normal.x * -2, start.y + normal.y * -2);
-  ctx.lineTo(end.x + normal.x * -2, end.y + normal.y * -2);
+  ctx.moveTo(renderStart.x + normal.x * -2, renderStart.y + normal.y * -2);
+  ctx.lineTo(renderEnd.x + normal.x * -2, renderEnd.y + normal.y * -2);
   ctx.stroke();
   ctx.restore();
+}
+
+function drawHoleThreadFill(
+  ctx: CanvasRenderingContext2D,
+  project: Project,
+  fillMap = getHoleFillMap(project),
+) {
+  const holeRadius = getHoleRadius(project.canvas);
+
+  for (const [key, fill] of fillMap) {
+    if (fill.load <= 0) {
+      continue;
+    }
+
+    const [col, row] = key.split(":").map(Number);
+    const point = holeToWorld({ col, row }, project.canvas);
+    const loadRatio = clamp(fill.load / MAX_HOLE_STRAND_UNITS, 0, 1);
+    const radius = holeRadius * (0.42 + loadRatio * 0.52);
+    const red = Math.round(fill.red / fill.load);
+    const green = Math.round(fill.green / fill.load);
+    const blue = Math.round(fill.blue / fill.load);
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${red}, ${green}, ${blue}, ${0.38 + loadRatio * 0.32})`;
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, radius * 0.82, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(52, 34, 24, ${0.08 + loadRatio * 0.13})`;
+    ctx.fill();
+
+    if (loadRatio >= 0.66) {
+      ctx.beginPath();
+      ctx.arc(
+        point.x - radius * 0.22,
+        point.y - radius * 0.22,
+        radius * 0.42,
+        0,
+        Math.PI * 2,
+      );
+      ctx.fillStyle = "rgba(255, 248, 239, 0.16)";
+      ctx.fill();
+    }
+
+    ctx.restore();
+  }
 }
 
 function drawStitches(ctx: CanvasRenderingContext2D, project: Project) {
@@ -695,6 +921,8 @@ function drawStitches(ctx: CanvasRenderingContext2D, project: Project) {
       drawThreadStitch(ctx, stitch, color, project.canvas);
     }
   }
+
+  drawHoleThreadFill(ctx, project, getHoleFillMap(project, paletteMap));
 }
 
 function hashString(value: string) {
@@ -781,7 +1009,7 @@ function createExportCanvas(project: Project) {
 
   ctx.setTransform(EXPORT_SCALE, 0, 0, EXPORT_SCALE, 0, 0);
   ctx.clearRect(0, 0, world.width, world.height);
-  drawPlasticCanvas(ctx, project);
+  drawPerforatedSheet(ctx, project);
   drawStitches(ctx, project);
 
   return canvas;
@@ -886,11 +1114,18 @@ export default function NeedlepointEditor() {
   const hasFitViewRef = useRef(false);
 
   const meshCount = getMeshCount(project.canvas);
-  const physicalWidth = (project.canvas.cols - 1) / meshCount;
-  const physicalHeight = (project.canvas.rows - 1) / meshCount;
+  const physicalWidth = project.canvas.widthIn;
+  const physicalHeight = project.canvas.heightIn;
+  const stitchCellsWide = project.canvas.cols - 1;
+  const stitchCellsHigh = project.canvas.rows - 1;
   const strandWidth = getThreadWidthForStrands(strandCount);
   const coveragePercent = Math.round(
     (strandWidth / getGridSpacing(project.canvas)) * 100,
+  );
+  const holeLoadMap = useMemo(() => getHoleLoadMap(project), [project]);
+  const maxHoleLoad = useMemo(
+    () => Math.max(0, ...holeLoadMap.values()),
+    [holeLoadMap],
   );
   const paletteMap = useMemo(() => buildPaletteMap(project.palette), [project.palette]);
   const selectedColor = paletteMap.get(selectedColorId) ?? project.palette[0];
@@ -1096,7 +1331,7 @@ export default function NeedlepointEditor() {
 
     ctx.save();
     applyViewTransform(ctx, view, project.canvas);
-    drawPlasticCanvas(
+    drawPerforatedSheet(
       ctx,
       project,
       referenceElementRef.current && referenceImage
@@ -1131,6 +1366,11 @@ export default function NeedlepointEditor() {
 
     ctx.save();
     applyViewTransform(ctx, view, project.canvas);
+    const dragCapacity =
+      drag?.from && drag.to && !sameHole(drag.from, drag.to)
+        ? canAddStitchWithLoadMap(holeLoadMap, drag.from, drag.to, strandCount)
+        : null;
+    const isDragBlocked = dragCapacity?.canAdd === false;
 
     if (hoveredStitchId) {
       const hovered = project.stitches.find((stitch) => stitch.id === hoveredStitchId);
@@ -1162,9 +1402,9 @@ export default function NeedlepointEditor() {
           thickness: strandWidth,
           strands: strandCount,
         },
-        activePreviewColor,
+        isDragBlocked ? "#b0473b" : activePreviewColor,
         project.canvas,
-        0.72,
+        isDragBlocked ? 0.58 : 0.72,
       );
     }
 
@@ -1175,13 +1415,17 @@ export default function NeedlepointEditor() {
 
       ctx.beginPath();
       ctx.arc(point.x, point.y, getGridSpacing(project.canvas) * 0.38, 0, Math.PI * 2);
-      ctx.strokeStyle = tool === "erase" ? "#7e4e36" : activePreviewColor;
+      ctx.strokeStyle =
+        tool === "erase" || isDragBlocked ? "#b0473b" : activePreviewColor;
       ctx.lineWidth = 2.2 / view.zoom;
       ctx.stroke();
 
       ctx.beginPath();
       ctx.arc(point.x, point.y, 2.4, 0, Math.PI * 2);
-      ctx.fillStyle = tool === "erase" ? "rgba(126, 78, 54, 0.72)" : activePreviewColor;
+      ctx.fillStyle =
+        tool === "erase" || isDragBlocked
+          ? "rgba(176, 71, 59, 0.72)"
+          : activePreviewColor;
       ctx.fill();
     }
 
@@ -1201,6 +1445,7 @@ export default function NeedlepointEditor() {
     activeColorId,
     drag,
     hoverHole,
+    holeLoadMap,
     hoveredStitchId,
     project.canvas,
     project.stitches,
@@ -1289,7 +1534,7 @@ export default function NeedlepointEditor() {
     const startHole = nearestHole(worldPoint, project.canvas);
 
     if (!startHole) {
-      notify("Start on a canvas hole.", "warn");
+      notify("Start on a sheet hole.", "warn");
       return;
     }
 
@@ -1354,6 +1599,16 @@ export default function NeedlepointEditor() {
       return;
     }
 
+    const capacity = canAddStitch(project, drag.from, destination, strandCount);
+
+    if (!capacity.canAdd) {
+      notify(
+        `That hole cannot fit this stitch: ${capacity.blockedLoad}/${MAX_HOLE_STRAND_UNITS} strand capacity used.`,
+        "warn",
+      );
+      return;
+    }
+
     commitProject({
       ...project,
       stitches: [
@@ -1408,20 +1663,6 @@ export default function NeedlepointEditor() {
     notify("Thread color added.", "success");
   };
 
-  const changeMeshCount = (nextMeshCount: number) => {
-    const nextProject = {
-      ...project,
-      canvas: {
-        ...project.canvas,
-        meshCount: nextMeshCount,
-      },
-    };
-
-    commitProject(nextProject);
-    fitViewToCanvas(nextProject.canvas);
-    notify(`${nextMeshCount}-count canvas selected.`, "info");
-  };
-
   const resetProject = () => {
     const nextProject = makeDefaultProject();
 
@@ -1429,7 +1670,7 @@ export default function NeedlepointEditor() {
     setSelectedColorId(INITIAL_SELECTED_COLOR_ID);
     setStrandCount(DEFAULT_STRAND_COUNT);
     fitViewToCanvas(nextProject.canvas);
-    notify("Canvas reset. Undo is available.", "info");
+    notify("Sheet reset. Undo is available.", "info");
   };
 
   const exportPng = () => {
@@ -1439,7 +1680,7 @@ export default function NeedlepointEditor() {
 
     if (!canvas) {
       setExporting(false);
-      notify("Could not export this canvas.", "warn");
+      notify("Could not export this sheet.", "warn");
       return;
     }
 
@@ -1447,7 +1688,7 @@ export default function NeedlepointEditor() {
       setExporting(false);
 
       if (!blob) {
-        notify("Could not export this canvas.", "warn");
+        notify("Could not export this sheet.", "warn");
         return;
       }
 
@@ -1566,17 +1807,17 @@ export default function NeedlepointEditor() {
           <IconButton label="Zoom out" onClick={() => zoomAroundCenter(0.88)}>
             <Minus size={18} strokeWidth={1.8} />
           </IconButton>
-          <IconButton label="Fit canvas" onClick={fitView}>
+          <IconButton label="Fit sheet" onClick={fitView}>
             <Maximize2 size={18} strokeWidth={1.8} />
           </IconButton>
-          <IconButton label="Rotate canvas 90 degrees" onClick={() => rotateViewBy(90)}>
+          <IconButton label="Rotate sheet 90 degrees" onClick={() => rotateViewBy(90)}>
             <RotateCw size={18} strokeWidth={1.8} />
           </IconButton>
           <div className="hidden h-px w-9 bg-[#c7aa8e] lg:block" />
           <IconButton label="Export PNG" disabled={exporting} onClick={exportPng}>
             <Download size={18} strokeWidth={1.8} />
           </IconButton>
-          <IconButton label="Reset canvas" onClick={resetProject}>
+          <IconButton label="Reset sheet" onClick={resetProject}>
             <RotateCcw size={18} strokeWidth={1.8} />
           </IconButton>
         </aside>
@@ -1588,8 +1829,8 @@ export default function NeedlepointEditor() {
                 Needler
               </h1>
               <p className="text-sm text-[#765943]">
-                {project.canvas.cols} by {project.canvas.rows} holes,{" "}
-                {meshCount}-count canvas
+                {physicalWidth} x {physicalHeight} in, {meshCount}-count
+                perforated paper
               </p>
             </div>
             <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-[0.08em] text-[#765943]">
@@ -1801,7 +2042,7 @@ export default function NeedlepointEditor() {
                 </>
               ) : (
                 <p className="text-xs leading-5 text-[#8a6c55]">
-                  Trace from a photo or sketch beneath the canvas grid.
+                  Trace from a photo or sketch beneath the sheet grid.
                 </p>
               )}
             </div>
@@ -1809,7 +2050,7 @@ export default function NeedlepointEditor() {
 
           <section className="border-t border-[#e4d2bf] pt-4">
             <h2 className="text-sm font-semibold uppercase tracking-[0.1em] text-[#765943]">
-              Canvas rotation
+              Sheet rotation
             </h2>
             <div className="mt-3 grid gap-3">
               <div className="grid grid-cols-3 gap-2">
@@ -1864,26 +2105,20 @@ export default function NeedlepointEditor() {
 
           <section className="border-t border-[#e4d2bf] pt-4">
             <h2 className="text-sm font-semibold uppercase tracking-[0.1em] text-[#765943]">
-              Canvas realism
+              Sheet realism
             </h2>
             <div className="mt-3 grid gap-3">
-              <label className="grid gap-2 text-sm font-medium text-[#4f392b]">
-                Mesh count
-                <select
-                  value={meshCount}
-                  className="h-10 rounded-md border border-[#d8c4ad] bg-white px-3 text-sm outline-none transition focus:border-[#7e4e36]"
-                  onChange={(event) => changeMeshCount(Number(event.target.value))}
-                >
-                  {MESH_OPTIONS.map((option) => (
-                    <option key={option} value={option}>
-                      {option} holes per inch
-                    </option>
-                  ))}
-                </select>
-              </label>
               <div className="grid grid-cols-2 gap-2 rounded-md border border-[#e4d2bf] bg-white/70 px-3 py-2 font-mono text-xs text-[#765943]">
                 <span>{physicalWidth.toFixed(2)} in wide</span>
                 <span>{physicalHeight.toFixed(2)} in high</span>
+                <span>{meshCount}-count sheet</span>
+                <span>{project.canvas.material.replace("-", " ")}</span>
+                <span>
+                  {stitchCellsWide} x {stitchCellsHigh} cells
+                </span>
+                <span>
+                  {project.canvas.cols} x {project.canvas.rows} holes
+                </span>
               </div>
               <label className="flex flex-col gap-2 text-sm font-medium text-[#4f392b]">
                 DMC strands
@@ -1899,16 +2134,13 @@ export default function NeedlepointEditor() {
               <div className="font-mono text-xs text-[#765943]">
                 {strandCount} strands, {coveragePercent}% pitch coverage
               </div>
-              {meshCount <= 10 ? (
-                <p className="text-xs leading-5 text-[#8a6c55]">
-                  Low-count plastic canvas is yarn territory; DMC floss will
-                  intentionally leave more open canvas.
-                </p>
-              ) : (
-                <p className="text-xs leading-5 text-[#8a6c55]">
-                  6 to 8 strands should visually fill 13 to 14 mesh.
-                </p>
-              )}
+              <div className="grid grid-cols-2 gap-2 rounded-md border border-[#e4d2bf] bg-white/70 px-3 py-2 font-mono text-xs text-[#765943]">
+                <span>{MAX_HOLE_STRAND_UNITS} strands max per hole</span>
+                <span>{maxHoleLoad}/{MAX_HOLE_STRAND_UNITS} current max</span>
+              </div>
+              <p className="text-xs leading-5 text-[#8a6c55]">
+                Three 6-strand DMC passes fill a hole; additional passes are blocked.
+              </p>
             </div>
           </section>
 
