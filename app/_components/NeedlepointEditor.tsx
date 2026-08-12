@@ -1,0 +1,1987 @@
+"use client";
+
+import {
+  Download,
+  Eraser,
+  ImageOff,
+  ImagePlus,
+  Maximize2,
+  Minus,
+  Move,
+  PenLine,
+  Plus,
+  Redo2,
+  RotateCcw,
+  RotateCw,
+  Undo2,
+} from "lucide-react";
+import { DMC_COLORS } from "@/app/_data/dmcColors";
+import type { DmcColor } from "@/app/_data/dmcColors";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
+import type { ReactNode } from "react";
+
+type Hole = { col: number; row: number };
+type Stitch = {
+  id: string;
+  from: Hole;
+  to: Hole;
+  colorId: string;
+  thickness: number;
+  strands?: number;
+};
+type PaletteColor = {
+  id: string;
+  name: string;
+  hex: string;
+  floss?: string;
+  source?: "dmc" | "custom";
+};
+type Project = {
+  version: 1;
+  canvas: { cols: number; rows: number; meshCount?: number };
+  palette: PaletteColor[];
+  stitches: Stitch[];
+};
+
+type Tool = "stitch" | "erase" | "pan";
+type Point = { x: number; y: number };
+type ViewState = { zoom: number; pan: Point; rotation: number };
+type ReferenceImageState = {
+  src: string;
+  name: string;
+  opacity: number;
+  width: number | null;
+  height: number | null;
+};
+type DragState = { from: Hole; to: Hole | null } | null;
+type PanDragState =
+  | {
+      pointerId: number;
+      start: Point;
+      origin: Point;
+    }
+  | null;
+type NoticeTone = "info" | "warn" | "success";
+type Notice = { id: number; message: string; tone: NoticeTone };
+
+type EditorState = {
+  project: Project;
+  past: Project[];
+  future: Project[];
+  hydrated: boolean;
+};
+
+type EditorAction =
+  | { type: "hydrate"; project: Project }
+  | { type: "commit"; project: Project }
+  | { type: "undo" }
+  | { type: "redo" };
+
+const STORAGE_KEY = "needler.project.v1";
+const MAX_HISTORY = 100;
+const DEFAULT_MESH_COUNT = 14;
+const DEFAULT_STRAND_COUNT = 6;
+const DISPLAY_PIXELS_PER_INCH = 252;
+const DMC_STRAND_DIAMETER_INCH = 0.0265;
+const MESH_OPTIONS = [7, 10, 14, 18];
+const MIN_ZOOM = 0.32;
+const MAX_ZOOM = 2.7;
+const EXPORT_SCALE = 3;
+
+const DMC_BY_FLOSS = new Map(DMC_COLORS.map((color) => [color.floss, color]));
+const DEFAULT_DMC_FLOSS = [
+  "3848",
+  "3811",
+  "B5200",
+  "White",
+  "Ecru",
+  "3011",
+  "3012",
+  "730",
+  "321",
+  "304",
+  "729",
+  "3829",
+];
+const LEGACY_COLOR_TO_DMC: Record<string, string> = {
+  "reef-teal": "3848",
+  "sea-glass": "3811",
+  linen: "Ecru",
+  "olive-stem": "3011",
+  "sage-shadow": "3012",
+  "madder-red": "321",
+  "antique-gold": "729",
+};
+
+function dmcColorId(floss: string) {
+  return `dmc-${floss}`;
+}
+
+function paletteColorFromDmc(color: DmcColor): PaletteColor {
+  return {
+    id: dmcColorId(color.floss),
+    name: color.name,
+    hex: color.hex,
+    floss: color.floss,
+    source: "dmc",
+  };
+}
+
+function getDmcPaletteColor(floss: string) {
+  const color = DMC_BY_FLOSS.get(floss);
+
+  return color ? paletteColorFromDmc(color) : null;
+}
+
+const DEFAULT_PALETTE: PaletteColor[] = DEFAULT_DMC_FLOSS.map(
+  getDmcPaletteColor,
+).filter((color): color is PaletteColor => Boolean(color));
+
+const INITIAL_SELECTED_COLOR_ID = DEFAULT_PALETTE[0].id;
+
+function makeDefaultProject(): Project {
+  return {
+    version: 1,
+    canvas: { cols: 48, rows: 64, meshCount: DEFAULT_MESH_COUNT },
+    palette: DEFAULT_PALETTE.map((color) => ({ ...color })),
+    stitches: [],
+  };
+}
+
+function getPaletteLabel(color: PaletteColor) {
+  return color.floss ? `DMC ${color.floss} ${color.name}` : color.name;
+}
+
+function normalizeProject(project: Project): Project {
+  const paletteById = new Map<string, PaletteColor>();
+
+  for (const color of project.palette) {
+    const migratedDmc = LEGACY_COLOR_TO_DMC[color.id];
+    const nextColor = migratedDmc ? getDmcPaletteColor(migratedDmc) : color;
+
+    if (nextColor) {
+      paletteById.set(nextColor.id, nextColor);
+    }
+  }
+
+  for (const color of DEFAULT_PALETTE) {
+    if (!paletteById.has(color.id)) {
+      paletteById.set(color.id, color);
+    }
+  }
+
+  return {
+    ...project,
+    canvas: {
+      ...project.canvas,
+      meshCount: getMeshCount(project.canvas),
+    },
+    palette: [...paletteById.values()],
+    stitches: project.stitches.map((stitch) => {
+      const migratedDmc = LEGACY_COLOR_TO_DMC[stitch.colorId];
+      const nextColorId = migratedDmc ? dmcColorId(migratedDmc) : stitch.colorId;
+      const nextStrands =
+        stitch.strands ?? getLegacyStrandsFromThickness(stitch.thickness);
+
+      return {
+        ...stitch,
+        colorId: nextColorId,
+        strands: nextStrands,
+        thickness: getThreadWidthForStrands(nextStrands),
+      };
+    }),
+  };
+}
+
+function editorReducer(state: EditorState, action: EditorAction): EditorState {
+  switch (action.type) {
+    case "hydrate":
+      return {
+        project: action.project,
+        past: [],
+        future: [],
+        hydrated: true,
+      };
+    case "commit":
+      return {
+        project: action.project,
+        past: [...state.past, state.project].slice(-MAX_HISTORY),
+        future: [],
+        hydrated: state.hydrated,
+      };
+    case "undo": {
+      const previous = state.past.at(-1);
+
+      if (!previous) {
+        return state;
+      }
+
+      return {
+        ...state,
+        project: previous,
+        past: state.past.slice(0, -1),
+        future: [state.project, ...state.future],
+      };
+    }
+    case "redo": {
+      const next = state.future[0];
+
+      if (!next) {
+        return state;
+      }
+
+      return {
+        ...state,
+        project: next,
+        past: [...state.past, state.project].slice(-MAX_HISTORY),
+        future: state.future.slice(1),
+      };
+    }
+  }
+}
+
+function getMeshCount(canvas: Project["canvas"]) {
+  return canvas.meshCount ?? DEFAULT_MESH_COUNT;
+}
+
+function getGridSpacing(canvas: Project["canvas"]) {
+  return DISPLAY_PIXELS_PER_INCH / getMeshCount(canvas);
+}
+
+function getGridPadding(canvas: Project["canvas"]) {
+  return Math.max(24, getGridSpacing(canvas) * 1.65);
+}
+
+function getHoleRadius(canvas: Project["canvas"]) {
+  return clamp(getGridSpacing(canvas) * 0.19, 2.4, 5.8);
+}
+
+function getThreadWidthForStrands(strands: number) {
+  return (
+    Math.sqrt(strands) *
+    DMC_STRAND_DIAMETER_INCH *
+    DISPLAY_PIXELS_PER_INCH *
+    1.04
+  );
+}
+
+function getLegacyStrandsFromThickness(thickness: number) {
+  const strandWidth =
+    DMC_STRAND_DIAMETER_INCH * DISPLAY_PIXELS_PER_INCH * 1.04;
+  const strands = Math.round((thickness / strandWidth) ** 2);
+
+  return clamp(strands || DEFAULT_STRAND_COUNT, 1, 8);
+}
+
+function getStitchWidth(stitch: Stitch) {
+  return stitch.strands
+    ? getThreadWidthForStrands(stitch.strands)
+    : stitch.thickness;
+}
+
+function getWorldSize(canvas: Project["canvas"]) {
+  const spacing = getGridSpacing(canvas);
+  const padding = getGridPadding(canvas);
+
+  return {
+    width: (canvas.cols - 1) * spacing + padding * 2,
+    height: (canvas.rows - 1) * spacing + padding * 2,
+  };
+}
+
+function getWorldCenter(canvas: Project["canvas"]): Point {
+  const world = getWorldSize(canvas);
+
+  return { x: world.width / 2, y: world.height / 2 };
+}
+
+function holeToWorld(hole: Hole, canvas: Project["canvas"]): Point {
+  const spacing = getGridSpacing(canvas);
+  const padding = getGridPadding(canvas);
+
+  return {
+    x: padding + hole.col * spacing,
+    y: padding + hole.row * spacing,
+  };
+}
+
+function degreesToRadians(degrees: number) {
+  return (degrees * Math.PI) / 180;
+}
+
+function normalizeRotation(degrees: number) {
+  const normalized = ((degrees % 360) + 360) % 360;
+
+  return normalized > 180 ? normalized - 360 : normalized;
+}
+
+function getRotatedWorldBounds(canvas: Project["canvas"], rotation: number) {
+  const world = getWorldSize(canvas);
+  const radians = degreesToRadians(rotation);
+  const cos = Math.abs(Math.cos(radians));
+  const sin = Math.abs(Math.sin(radians));
+
+  return {
+    width: world.width * cos + world.height * sin,
+    height: world.width * sin + world.height * cos,
+  };
+}
+
+function applyViewTransform(
+  ctx: CanvasRenderingContext2D,
+  view: ViewState,
+  canvas: Project["canvas"],
+) {
+  const center = getWorldCenter(canvas);
+
+  ctx.translate(view.pan.x, view.pan.y);
+  ctx.rotate(degreesToRadians(view.rotation));
+  ctx.scale(view.zoom, view.zoom);
+  ctx.translate(-center.x, -center.y);
+}
+
+function screenToWorld(
+  point: Point,
+  view: ViewState,
+  canvas: Project["canvas"],
+): Point {
+  const center = getWorldCenter(canvas);
+  const radians = degreesToRadians(-view.rotation);
+  const dx = point.x - view.pan.x;
+  const dy = point.y - view.pan.y;
+  const rotatedX = dx * Math.cos(radians) - dy * Math.sin(radians);
+  const rotatedY = dx * Math.sin(radians) + dy * Math.cos(radians);
+
+  return {
+    x: rotatedX / view.zoom + center.x,
+    y: rotatedY / view.zoom + center.y,
+  };
+}
+
+function worldToScreen(
+  point: Point,
+  view: ViewState,
+  canvas: Project["canvas"],
+): Point {
+  const center = getWorldCenter(canvas);
+  const radians = degreesToRadians(view.rotation);
+  const dx = (point.x - center.x) * view.zoom;
+  const dy = (point.y - center.y) * view.zoom;
+
+  return {
+    x: view.pan.x + dx * Math.cos(radians) - dy * Math.sin(radians),
+    y: view.pan.y + dx * Math.sin(radians) + dy * Math.cos(radians),
+  };
+}
+
+function nearestHole(point: Point, canvas: Project["canvas"]): Hole | null {
+  const spacing = getGridSpacing(canvas);
+  const padding = getGridPadding(canvas);
+  const col = Math.round((point.x - padding) / spacing);
+  const row = Math.round((point.y - padding) / spacing);
+
+  if (col < 0 || row < 0 || col >= canvas.cols || row >= canvas.rows) {
+    return null;
+  }
+
+  const snapped = holeToWorld({ col, row }, canvas);
+  const distance = Math.hypot(point.x - snapped.x, point.y - snapped.y);
+
+  return distance <= spacing * 0.78 ? { col, row } : null;
+}
+
+function sameHole(a: Hole | null, b: Hole | null) {
+  return Boolean(a && b && a.col === b.col && a.row === b.row);
+}
+
+function getClientPoint(
+  event: { clientX: number; clientY: number },
+  stage: HTMLElement | null,
+): Point | null {
+  if (!stage) {
+    return null;
+  }
+
+  const rect = stage.getBoundingClientRect();
+
+  return {
+    x: event.clientX - rect.left,
+    y: event.clientY - rect.top,
+  };
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function buildPaletteMap(palette: PaletteColor[]) {
+  return new Map(palette.map((color) => [color.id, color]));
+}
+
+function isProject(value: unknown): value is Project {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Project;
+
+  return (
+    candidate.version === 1 &&
+    Boolean(candidate.canvas) &&
+    Number.isInteger(candidate.canvas.cols) &&
+    Number.isInteger(candidate.canvas.rows) &&
+    Array.isArray(candidate.palette) &&
+    Array.isArray(candidate.stitches)
+  );
+}
+
+function hexToRgb(hex: string) {
+  const value = hex.replace("#", "");
+  const normalized =
+    value.length === 3
+      ? value
+          .split("")
+          .map((char) => char + char)
+          .join("")
+      : value;
+  const numeric = Number.parseInt(normalized, 16);
+
+  return {
+    r: (numeric >> 16) & 255,
+    g: (numeric >> 8) & 255,
+    b: numeric & 255,
+  };
+}
+
+function rgba(hex: string, alpha: number) {
+  const { r, g, b } = hexToRgb(hex);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function shiftHex(hex: string, amount: number) {
+  const { r, g, b } = hexToRgb(hex);
+  const shift = (channel: number) => clamp(channel + amount, 0, 255);
+  const toHex = (channel: number) => shift(channel).toString(16).padStart(2, "0");
+
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+
+function roundedRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  radius: number,
+) {
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.lineTo(x + width - radius, y);
+  ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
+  ctx.lineTo(x + width, y + height - radius);
+  ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+  ctx.lineTo(x + radius, y + height);
+  ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
+  ctx.lineTo(x, y + radius);
+  ctx.quadraticCurveTo(x, y, x + radius, y);
+  ctx.closePath();
+}
+
+function prepareCanvas(
+  canvas: HTMLCanvasElement | null,
+  viewport: Point,
+): CanvasRenderingContext2D | null {
+  if (!canvas || viewport.x <= 0 || viewport.y <= 0) {
+    return null;
+  }
+
+  const dpr = window.devicePixelRatio || 1;
+  const width = Math.floor(viewport.x);
+  const height = Math.floor(viewport.y);
+
+  canvas.width = Math.floor(width * dpr);
+  canvas.height = Math.floor(height * dpr);
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${height}px`;
+
+  const ctx = canvas.getContext("2d");
+
+  if (!ctx) {
+    return null;
+  }
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+
+  return ctx;
+}
+
+function drawReferenceImage(
+  ctx: CanvasRenderingContext2D,
+  image: HTMLImageElement,
+  world: { width: number; height: number },
+  opacity: number,
+) {
+  const imageWidth = image.naturalWidth || image.width;
+  const imageHeight = image.naturalHeight || image.height;
+
+  if (imageWidth <= 0 || imageHeight <= 0) {
+    return;
+  }
+
+  const scale = Math.min(world.width / imageWidth, world.height / imageHeight);
+  const width = imageWidth * scale;
+  const height = imageHeight * scale;
+  const x = (world.width - width) / 2;
+  const y = (world.height - height) / 2;
+
+  ctx.save();
+  ctx.globalAlpha = clamp(opacity, 0, 1);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(image, x, y, width, height);
+  ctx.restore();
+}
+
+function drawPlasticCanvas(
+  ctx: CanvasRenderingContext2D,
+  project: Project,
+  referenceImage?: { image: HTMLImageElement; opacity: number } | null,
+) {
+  const world = getWorldSize(project.canvas);
+  const holeRadius = getHoleRadius(project.canvas);
+
+  ctx.save();
+  ctx.shadowColor = "rgba(80, 48, 28, 0.16)";
+  ctx.shadowBlur = 20;
+  ctx.shadowOffsetY = 10;
+  roundedRect(ctx, 0, 0, world.width, world.height, 8);
+  ctx.fillStyle = "#e6c7b2";
+  ctx.fill();
+  ctx.restore();
+
+  ctx.save();
+  roundedRect(ctx, 0, 0, world.width, world.height, 8);
+  ctx.clip();
+
+  const fiberGradient = ctx.createLinearGradient(0, 0, world.width, world.height);
+  fiberGradient.addColorStop(0, "rgba(255, 255, 255, 0.28)");
+  fiberGradient.addColorStop(0.46, "rgba(255, 255, 255, 0)");
+  fiberGradient.addColorStop(1, "rgba(87, 52, 34, 0.11)");
+  ctx.fillStyle = fiberGradient;
+  ctx.fillRect(0, 0, world.width, world.height);
+
+  if (referenceImage) {
+    drawReferenceImage(ctx, referenceImage.image, world, referenceImage.opacity);
+  }
+
+  for (let y = 8; y < world.height; y += 13) {
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(world.width, y + 10);
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.08)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  for (let row = 0; row < project.canvas.rows; row += 1) {
+    for (let col = 0; col < project.canvas.cols; col += 1) {
+      const point = holeToWorld({ col, row }, project.canvas);
+
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, holeRadius, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(91, 61, 49, 0.78)";
+      ctx.fill();
+
+      ctx.beginPath();
+      ctx.arc(point.x - 0.55, point.y - 0.55, holeRadius + 0.25, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(255, 246, 235, 0.52)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+  }
+
+  ctx.strokeStyle = "rgba(96, 62, 44, 0.26)";
+  ctx.lineWidth = 1;
+  roundedRect(ctx, 0.5, 0.5, world.width - 1, world.height - 1, 8);
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+function drawThreadStitch(
+  ctx: CanvasRenderingContext2D,
+  stitch: Stitch,
+  color: string,
+  canvas: Project["canvas"],
+  alpha = 1,
+) {
+  const start = holeToWorld(stitch.from, canvas);
+  const end = holeToWorld(stitch.to, canvas);
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const length = Math.max(1, Math.hypot(dx, dy));
+  const normal = { x: -dy / length, y: dx / length };
+  const middle = { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
+  const threadWidth = getStitchWidth(stitch);
+  const ridgeCount = clamp(Math.round((stitch.strands ?? 6) + 1), 4, 10);
+  const baseWidth = Math.max(1.45, threadWidth / ridgeCount);
+  const seed = hashString(stitch.id);
+
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.shadowColor = "rgba(56, 33, 21, 0.22)";
+  ctx.shadowBlur = 2.2;
+  ctx.shadowOffsetY = 1.2;
+  ctx.strokeStyle = rgba(color, 0.42);
+  ctx.lineWidth = threadWidth + 2.4;
+  ctx.beginPath();
+  ctx.moveTo(start.x, start.y);
+  ctx.lineTo(end.x, end.y);
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+
+  for (let index = 0; index < ridgeCount; index += 1) {
+    const spread = index - (ridgeCount - 1) / 2;
+    const jitter = Math.sin(seed + index * 1.7) * 0.42;
+    const offset = spread * baseWidth * 0.88 + jitter;
+    const curve = Math.cos(seed * 0.12 + index) * 0.75;
+    const shade = index % 2 === 0 ? shiftHex(color, 15) : shiftHex(color, -10);
+
+    ctx.strokeStyle = shade;
+    ctx.lineWidth = baseWidth * 1.18;
+    ctx.beginPath();
+    ctx.moveTo(start.x + normal.x * offset, start.y + normal.y * offset);
+    ctx.quadraticCurveTo(
+      middle.x + normal.x * (offset + curve),
+      middle.y + normal.y * (offset + curve),
+      end.x + normal.x * offset,
+      end.y + normal.y * offset,
+    );
+    ctx.stroke();
+  }
+
+  ctx.globalAlpha = alpha * 0.42;
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.72)";
+  ctx.lineWidth = 0.9;
+  ctx.beginPath();
+  ctx.moveTo(start.x + normal.x * -2, start.y + normal.y * -2);
+  ctx.lineTo(end.x + normal.x * -2, end.y + normal.y * -2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawStitches(ctx: CanvasRenderingContext2D, project: Project) {
+  const paletteMap = buildPaletteMap(project.palette);
+
+  for (const stitch of project.stitches) {
+    const color = paletteMap.get(stitch.colorId)?.hex ?? project.palette[0]?.hex;
+
+    if (color) {
+      drawThreadStitch(ctx, stitch, color, project.canvas);
+    }
+  }
+}
+
+function hashString(value: string) {
+  let hash = 0;
+
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash << 5) - hash + value.charCodeAt(index);
+    hash |= 0;
+  }
+
+  return Math.abs(hash);
+}
+
+function distanceToSegment(point: Point, start: Point, end: Point) {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const lengthSquared = dx * dx + dy * dy;
+
+  if (lengthSquared === 0) {
+    return Math.hypot(point.x - start.x, point.y - start.y);
+  }
+
+  const t = clamp(
+    ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared,
+    0,
+    1,
+  );
+  const projection = {
+    x: start.x + t * dx,
+    y: start.y + t * dy,
+  };
+
+  return Math.hypot(point.x - projection.x, point.y - projection.y);
+}
+
+function findNearestStitch(
+  point: Point,
+  project: Project,
+  view: ViewState,
+): Stitch | null {
+  let nearest: { stitch: Stitch; distance: number } | null = null;
+  const screenDistance = 13 / view.zoom;
+
+  for (const stitch of project.stitches) {
+    const distance = distanceToSegment(
+      point,
+      holeToWorld(stitch.from, project.canvas),
+      holeToWorld(stitch.to, project.canvas),
+    );
+    const threshold = screenDistance + getStitchWidth(stitch) * 0.5;
+
+    if (distance <= threshold && (!nearest || distance < nearest.distance)) {
+      nearest = { stitch, distance };
+    }
+  }
+
+  return nearest?.stitch ?? null;
+}
+
+function makeStitch(from: Hole, to: Hole, colorId: string, strands: number) {
+  return {
+    id: `stitch-${Date.now().toString(36)}-${Math.random()
+      .toString(36)
+      .slice(2, 8)}`,
+    from,
+    to,
+    colorId,
+    thickness: getThreadWidthForStrands(strands),
+    strands,
+  };
+}
+
+function createExportCanvas(project: Project) {
+  const world = getWorldSize(project.canvas);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(world.width * EXPORT_SCALE);
+  canvas.height = Math.round(world.height * EXPORT_SCALE);
+
+  const ctx = canvas.getContext("2d");
+
+  if (!ctx) {
+    return null;
+  }
+
+  ctx.setTransform(EXPORT_SCALE, 0, 0, EXPORT_SCALE, 0, 0);
+  ctx.clearRect(0, 0, world.width, world.height);
+  drawPlasticCanvas(ctx, project);
+  drawStitches(ctx, project);
+
+  return canvas;
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function formatTimestamp() {
+  return new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+}
+
+function toolButtonClass(active?: boolean) {
+  return [
+    "flex h-11 w-11 items-center justify-center rounded-md border text-sm transition active:translate-y-px disabled:cursor-not-allowed disabled:opacity-35",
+    active
+      ? "border-[#7e4e36] bg-[#7e4e36] text-[#fff9f0] shadow-[inset_0_1px_0_rgba(255,255,255,0.18)]"
+      : "border-[#d8c4ad] bg-[#fff8ef] text-[#4f392b] hover:border-[#b99b7d] hover:bg-white",
+  ].join(" ");
+}
+
+function panelButtonClass(variant: "solid" | "quiet" = "quiet") {
+  return [
+    "inline-flex h-10 items-center justify-center gap-2 rounded-md border px-3 text-sm font-medium transition active:translate-y-px disabled:cursor-not-allowed disabled:opacity-45",
+    variant === "solid"
+      ? "border-[#7e4e36] bg-[#7e4e36] text-[#fffaf3] hover:bg-[#6f422d]"
+      : "border-[#d8c4ad] bg-[#fff8ef] text-[#4f392b] hover:border-[#b99b7d] hover:bg-white",
+  ].join(" ");
+}
+
+function IconButton({
+  label,
+  active,
+  disabled,
+  onClick,
+  children,
+}: {
+  label: string;
+  active?: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      title={label}
+      className={toolButtonClass(active)}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      {children}
+    </button>
+  );
+}
+
+export default function NeedlepointEditor() {
+  const [state, dispatch] = useReducer(editorReducer, undefined, () => ({
+    project: makeDefaultProject(),
+    past: [],
+    future: [],
+    hydrated: false,
+  }));
+  const { project } = state;
+  const [selectedColorId, setSelectedColorId] = useState(
+    INITIAL_SELECTED_COLOR_ID,
+  );
+  const [strandCount, setStrandCount] = useState(DEFAULT_STRAND_COUNT);
+  const [tool, setTool] = useState<Tool>("stitch");
+  const [drag, setDrag] = useState<DragState>(null);
+  const [panDrag, setPanDrag] = useState<PanDragState>(null);
+  const [hoverHole, setHoverHole] = useState<Hole | null>(null);
+  const [hoveredStitchId, setHoveredStitchId] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [dmcQuery, setDmcQuery] = useState("");
+  const [customHex, setCustomHex] = useState("#c72b3b");
+  const [customName, setCustomName] = useState("Custom thread");
+  const [viewport, setViewport] = useState<Point>({ x: 0, y: 0 });
+  const [view, setView] = useState<ViewState>({
+    zoom: 1,
+    pan: { x: 0, y: 0 },
+    rotation: 0,
+  });
+  const [referenceImage, setReferenceImage] =
+    useState<ReferenceImageState | null>(null);
+
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const baseCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const stitchCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const previewCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const referenceElementRef = useRef<HTMLImageElement | null>(null);
+  const hasFitViewRef = useRef(false);
+
+  const meshCount = getMeshCount(project.canvas);
+  const physicalWidth = (project.canvas.cols - 1) / meshCount;
+  const physicalHeight = (project.canvas.rows - 1) / meshCount;
+  const strandWidth = getThreadWidthForStrands(strandCount);
+  const coveragePercent = Math.round(
+    (strandWidth / getGridSpacing(project.canvas)) * 100,
+  );
+  const paletteMap = useMemo(() => buildPaletteMap(project.palette), [project.palette]);
+  const selectedColor = paletteMap.get(selectedColorId) ?? project.palette[0];
+  const activeColorId =
+    selectedColor?.id ?? project.palette[0]?.id ?? INITIAL_SELECTED_COLOR_ID;
+  const activePreviewColor = selectedColor?.hex ?? "#559392";
+  const referenceSrc = referenceImage?.src ?? null;
+  const paletteIds = useMemo(
+    () => new Set(project.palette.map((color) => color.id)),
+    [project.palette],
+  );
+  const filteredDmcColors = useMemo(() => {
+    const query = dmcQuery.trim().toLowerCase();
+    const matches = query
+      ? DMC_COLORS.filter(
+          (color) =>
+            color.floss.toLowerCase().includes(query) ||
+            color.name.toLowerCase().includes(query),
+        )
+      : DMC_COLORS;
+
+    return matches.slice(0, 36);
+  }, [dmcQuery]);
+
+  const notify = useCallback((message: string, tone: NoticeTone = "info") => {
+    setNotice({ id: Date.now(), message, tone });
+  }, []);
+
+  const fitViewToCanvas = useCallback((canvas: Project["canvas"], rotation?: number) => {
+    setView((current) => {
+      const nextRotation = rotation ?? current.rotation;
+      const nextWorld = getRotatedWorldBounds(canvas, nextRotation);
+      const zoom = clamp(
+        Math.min(
+          Math.max(1, viewport.x - 48) / nextWorld.width,
+          Math.max(1, viewport.y - 48) / nextWorld.height,
+        ),
+        MIN_ZOOM,
+        MAX_ZOOM,
+      );
+
+      return {
+        zoom,
+        pan: {
+          x: viewport.x / 2,
+          y: viewport.y / 2,
+        },
+        rotation: nextRotation,
+      };
+    });
+  }, [viewport]);
+
+  const fitView = useCallback(() => {
+    fitViewToCanvas(project.canvas);
+  }, [fitViewToCanvas, project.canvas]);
+
+  const zoomAt = useCallback((screenPoint: Point, zoomFactor: number) => {
+    setView((current) => {
+      const nextZoom = clamp(current.zoom * zoomFactor, MIN_ZOOM, MAX_ZOOM);
+      const worldPoint = screenToWorld(screenPoint, current, project.canvas);
+      const nextView = { ...current, zoom: nextZoom };
+      const nextScreenPoint = worldToScreen(worldPoint, nextView, project.canvas);
+
+      return {
+        ...nextView,
+        pan: {
+          x: current.pan.x + screenPoint.x - nextScreenPoint.x,
+          y: current.pan.y + screenPoint.y - nextScreenPoint.y,
+        },
+      };
+    });
+  }, [project.canvas]);
+
+  const commitProject = useCallback((nextProject: Project) => {
+    dispatch({ type: "commit", project: nextProject });
+  }, []);
+
+  useEffect(() => {
+    let loadedProject: Project | null = null;
+
+    try {
+      const savedProject = window.localStorage.getItem(STORAGE_KEY);
+
+      if (savedProject) {
+        const parsed = JSON.parse(savedProject) as unknown;
+        loadedProject = isProject(parsed) ? parsed : null;
+      }
+    } catch {
+      loadedProject = null;
+    }
+
+    const nextProject = loadedProject
+      ? normalizeProject(loadedProject)
+      : makeDefaultProject();
+
+    dispatch({ type: "hydrate", project: nextProject });
+  }, []);
+
+  useEffect(() => {
+    if (!state.hydrated) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      try {
+        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(project));
+      } catch {
+        notify("Local storage is not available.", "warn");
+      }
+    }, 120);
+
+    return () => window.clearTimeout(timeout);
+  }, [notify, project, state.hydrated]);
+
+  useEffect(() => {
+    if (!notice) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => setNotice(null), 2400);
+
+    return () => window.clearTimeout(timeout);
+  }, [notice]);
+
+  useEffect(() => {
+    if (!referenceSrc) {
+      referenceElementRef.current = null;
+      return;
+    }
+
+    let isActive = true;
+    const image = new Image();
+
+    image.onload = () => {
+      if (!isActive) {
+        return;
+      }
+
+      referenceElementRef.current = image;
+      setReferenceImage((current) =>
+        current?.src === referenceSrc
+          ? {
+              ...current,
+              width: image.naturalWidth,
+              height: image.naturalHeight,
+            }
+          : current,
+      );
+    };
+
+    image.onerror = () => {
+      if (!isActive) {
+        return;
+      }
+
+      referenceElementRef.current = null;
+      setReferenceImage(null);
+      notify("Could not load that reference image.", "warn");
+    };
+
+    image.src = referenceSrc;
+
+    return () => {
+      isActive = false;
+    };
+  }, [notify, referenceSrc]);
+
+  useEffect(() => {
+    const stage = stageRef.current;
+
+    if (!stage) {
+      return;
+    }
+
+    const updateSize = () => {
+      setViewport({
+        x: stage.clientWidth,
+        y: stage.clientHeight,
+      });
+    };
+
+    updateSize();
+
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(stage);
+
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!hasFitViewRef.current && viewport.x > 0 && viewport.y > 0) {
+      hasFitViewRef.current = true;
+      fitView();
+    }
+  }, [fitView, viewport]);
+
+  useEffect(() => {
+    const ctx = prepareCanvas(baseCanvasRef.current, viewport);
+
+    if (!ctx) {
+      return;
+    }
+
+    ctx.save();
+    applyViewTransform(ctx, view, project.canvas);
+    drawPlasticCanvas(
+      ctx,
+      project,
+      referenceElementRef.current && referenceImage
+        ? {
+            image: referenceElementRef.current,
+            opacity: referenceImage.opacity,
+          }
+        : null,
+    );
+    ctx.restore();
+  }, [project, referenceImage, view, viewport]);
+
+  useEffect(() => {
+    const ctx = prepareCanvas(stitchCanvasRef.current, viewport);
+
+    if (!ctx) {
+      return;
+    }
+
+    ctx.save();
+    applyViewTransform(ctx, view, project.canvas);
+    drawStitches(ctx, project);
+    ctx.restore();
+  }, [project, view, viewport]);
+
+  useEffect(() => {
+    const ctx = prepareCanvas(previewCanvasRef.current, viewport);
+
+    if (!ctx) {
+      return;
+    }
+
+    ctx.save();
+    applyViewTransform(ctx, view, project.canvas);
+
+    if (hoveredStitchId) {
+      const hovered = project.stitches.find((stitch) => stitch.id === hoveredStitchId);
+
+      if (hovered) {
+        const start = holeToWorld(hovered.from, project.canvas);
+        const end = holeToWorld(hovered.to, project.canvas);
+
+        ctx.save();
+        ctx.lineCap = "round";
+        ctx.strokeStyle = "rgba(126, 78, 54, 0.36)";
+        ctx.lineWidth = getStitchWidth(hovered) + 8 / view.zoom;
+        ctx.beginPath();
+        ctx.moveTo(start.x, start.y);
+        ctx.lineTo(end.x, end.y);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    if (drag?.from && drag.to && !sameHole(drag.from, drag.to)) {
+      drawThreadStitch(
+        ctx,
+        {
+          id: "preview-stitch",
+          from: drag.from,
+          to: drag.to,
+          colorId: activeColorId,
+          thickness: strandWidth,
+          strands: strandCount,
+        },
+        activePreviewColor,
+        project.canvas,
+        0.72,
+      );
+    }
+
+    const markedHole = drag?.to ?? hoverHole;
+
+    if (markedHole) {
+      const point = holeToWorld(markedHole, project.canvas);
+
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, getGridSpacing(project.canvas) * 0.38, 0, Math.PI * 2);
+      ctx.strokeStyle = tool === "erase" ? "#7e4e36" : activePreviewColor;
+      ctx.lineWidth = 2.2 / view.zoom;
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, 2.4, 0, Math.PI * 2);
+      ctx.fillStyle = tool === "erase" ? "rgba(126, 78, 54, 0.72)" : activePreviewColor;
+      ctx.fill();
+    }
+
+    if (drag?.from) {
+      const point = holeToWorld(drag.from, project.canvas);
+
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, getGridSpacing(project.canvas) * 0.46, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(255, 248, 239, 0.88)";
+      ctx.lineWidth = 3 / view.zoom;
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }, [
+    activePreviewColor,
+    activeColorId,
+    drag,
+    hoverHole,
+    hoveredStitchId,
+    project.canvas,
+    project.stitches,
+    strandCount,
+    strandWidth,
+    tool,
+    view,
+    viewport,
+  ]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const isTyping =
+        target?.tagName === "INPUT" ||
+        target?.tagName === "TEXTAREA" ||
+        target?.isContentEditable;
+
+      if (isTyping) {
+        return;
+      }
+
+      const modKey = event.metaKey || event.ctrlKey;
+
+      if (modKey && event.key.toLowerCase() === "z") {
+        event.preventDefault();
+        dispatch({ type: event.shiftKey ? "redo" : "undo" });
+      }
+
+      if (modKey && event.key.toLowerCase() === "y") {
+        event.preventDefault();
+        dispatch({ type: "redo" });
+      }
+
+      if (event.key === "Escape") {
+        setDrag(null);
+        setPanDrag(null);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+  const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) {
+      return;
+    }
+
+    const screenPoint = getClientPoint(event, stageRef.current);
+
+    if (!screenPoint) {
+      return;
+    }
+
+    event.currentTarget.setPointerCapture(event.pointerId);
+
+    if (tool === "pan") {
+      setPanDrag({
+        pointerId: event.pointerId,
+        start: screenPoint,
+        origin: view.pan,
+      });
+      return;
+    }
+
+    const worldPoint = screenToWorld(screenPoint, view, project.canvas);
+
+    if (tool === "erase") {
+      const target = findNearestStitch(worldPoint, project, view);
+
+      if (!target) {
+        notify("No stitch selected.", "warn");
+        return;
+      }
+
+      commitProject({
+        ...project,
+        stitches: project.stitches.filter((stitch) => stitch.id !== target.id),
+      });
+      notify("Stitch removed.", "success");
+      return;
+    }
+
+    const startHole = nearestHole(worldPoint, project.canvas);
+
+    if (!startHole) {
+      notify("Start on a canvas hole.", "warn");
+      return;
+    }
+
+    setDrag({ from: startHole, to: startHole });
+    setHoverHole(startHole);
+  };
+
+  const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const screenPoint = getClientPoint(event, stageRef.current);
+
+    if (!screenPoint) {
+      return;
+    }
+
+    if (panDrag && panDrag.pointerId === event.pointerId) {
+      setView((current) => ({
+        ...current,
+        pan: {
+          x: panDrag.origin.x + screenPoint.x - panDrag.start.x,
+          y: panDrag.origin.y + screenPoint.y - panDrag.start.y,
+        },
+      }));
+      return;
+    }
+
+    const worldPoint = screenToWorld(screenPoint, view, project.canvas);
+
+    if (tool === "erase") {
+      setHoverHole(nearestHole(worldPoint, project.canvas));
+      setHoveredStitchId(findNearestStitch(worldPoint, project, view)?.id ?? null);
+      return;
+    }
+
+    const nextHole = nearestHole(worldPoint, project.canvas);
+    setHoverHole(nextHole);
+
+    if (drag) {
+      setDrag({ ...drag, to: nextHole });
+    }
+  };
+
+  const handlePointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (panDrag?.pointerId === event.pointerId) {
+      setPanDrag(null);
+      return;
+    }
+
+    if (!drag) {
+      return;
+    }
+
+    const screenPoint = getClientPoint(event, stageRef.current);
+    const destination =
+      screenPoint
+        ? nearestHole(screenToWorld(screenPoint, view, project.canvas), project.canvas)
+        : drag.to;
+
+    setDrag(null);
+
+    if (!destination || sameHole(drag.from, destination)) {
+      notify("Choose a different destination hole.", "warn");
+      return;
+    }
+
+    commitProject({
+      ...project,
+      stitches: [
+        ...project.stitches,
+        makeStitch(drag.from, destination, activeColorId, strandCount),
+      ],
+    });
+  };
+
+  const handleWheel = (event: React.WheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
+
+    const screenPoint = getClientPoint(event, stageRef.current);
+
+    if (!screenPoint) {
+      return;
+    }
+
+    zoomAt(screenPoint, event.deltaY > 0 ? 0.9 : 1.1);
+  };
+
+  const addDmcColor = (color: DmcColor) => {
+    const paletteColor = paletteColorFromDmc(color);
+
+    if (paletteIds.has(paletteColor.id)) {
+      setSelectedColorId(paletteColor.id);
+      notify(`DMC ${color.floss} selected.`, "info");
+      return;
+    }
+
+    commitProject({
+      ...project,
+      palette: [...project.palette, paletteColor],
+    });
+    setSelectedColorId(paletteColor.id);
+    notify(`DMC ${color.floss} added.`, "success");
+  };
+
+  const addCustomColor = () => {
+    const trimmedName = customName.trim() || "Custom thread";
+    const id = `thread-${Date.now().toString(36)}`;
+    const nextProject = {
+      ...project,
+      palette: [
+        ...project.palette,
+        { id, name: trimmedName, hex: customHex, source: "custom" as const },
+      ],
+    };
+
+    commitProject(nextProject);
+    setSelectedColorId(id);
+    notify("Thread color added.", "success");
+  };
+
+  const changeMeshCount = (nextMeshCount: number) => {
+    const nextProject = {
+      ...project,
+      canvas: {
+        ...project.canvas,
+        meshCount: nextMeshCount,
+      },
+    };
+
+    commitProject(nextProject);
+    fitViewToCanvas(nextProject.canvas);
+    notify(`${nextMeshCount}-count canvas selected.`, "info");
+  };
+
+  const resetProject = () => {
+    const nextProject = makeDefaultProject();
+
+    commitProject(nextProject);
+    setSelectedColorId(INITIAL_SELECTED_COLOR_ID);
+    setStrandCount(DEFAULT_STRAND_COUNT);
+    fitViewToCanvas(nextProject.canvas);
+    notify("Canvas reset. Undo is available.", "info");
+  };
+
+  const exportPng = () => {
+    setExporting(true);
+
+    const canvas = createExportCanvas(project);
+
+    if (!canvas) {
+      setExporting(false);
+      notify("Could not export this canvas.", "warn");
+      return;
+    }
+
+    canvas.toBlob((blob) => {
+      setExporting(false);
+
+      if (!blob) {
+        notify("Could not export this canvas.", "warn");
+        return;
+      }
+
+      downloadBlob(blob, `needler-design-${formatTimestamp()}.png`);
+      notify("PNG exported.", "success");
+    }, "image/png");
+  };
+
+  const zoomAroundCenter = (factor: number) => {
+    zoomAt({ x: viewport.x / 2, y: viewport.y / 2 }, factor);
+  };
+
+  const rotateViewBy = (degrees: number) => {
+    setView((current) => ({
+      ...current,
+      rotation: normalizeRotation(current.rotation + degrees),
+    }));
+  };
+
+  const changeViewRotation = (degrees: number) => {
+    setView((current) => ({
+      ...current,
+      rotation: normalizeRotation(degrees),
+    }));
+  };
+
+  const handleReferenceUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = "";
+
+    if (!file) {
+      return;
+    }
+
+    if (!file.type.startsWith("image/")) {
+      notify("Choose an image file.", "warn");
+      return;
+    }
+
+    const reader = new FileReader();
+
+    reader.onload = () => {
+      if (typeof reader.result !== "string") {
+        notify("Could not read that reference image.", "warn");
+        return;
+      }
+
+      referenceElementRef.current = null;
+      setReferenceImage({
+        src: reader.result,
+        name: file.name,
+        opacity: 0.42,
+        width: null,
+        height: null,
+      });
+      notify("Reference image loaded.", "success");
+    };
+
+    reader.onerror = () => {
+      notify("Could not read that reference image.", "warn");
+    };
+
+    reader.readAsDataURL(file);
+  };
+
+  const clearReferenceImage = () => {
+    referenceElementRef.current = null;
+    setReferenceImage(null);
+    notify("Reference image cleared.", "info");
+  };
+
+  return (
+    <main className="min-h-[100dvh] bg-[#f3ebdf] text-[#38271d]">
+      <div className="mx-auto grid min-h-[100dvh] w-full max-w-[1500px] grid-cols-1 gap-4 px-4 py-4 lg:grid-cols-[72px_minmax(0,1fr)_330px] lg:px-5">
+        <aside className="order-2 flex items-center gap-2 overflow-x-auto rounded-lg border border-[#d6bfa6] bg-[#ead9c4]/78 p-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.52)] lg:order-1 lg:flex-col lg:overflow-visible">
+          <IconButton
+            label="Stitch tool"
+            active={tool === "stitch"}
+            onClick={() => setTool("stitch")}
+          >
+            <PenLine size={18} strokeWidth={1.8} />
+          </IconButton>
+          <IconButton
+            label="Erase tool"
+            active={tool === "erase"}
+            onClick={() => setTool("erase")}
+          >
+            <Eraser size={18} strokeWidth={1.8} />
+          </IconButton>
+          <IconButton
+            label="Pan tool"
+            active={tool === "pan"}
+            onClick={() => setTool("pan")}
+          >
+            <Move size={18} strokeWidth={1.8} />
+          </IconButton>
+          <div className="hidden h-px w-9 bg-[#c7aa8e] lg:block" />
+          <IconButton
+            label="Undo"
+            disabled={state.past.length === 0}
+            onClick={() => dispatch({ type: "undo" })}
+          >
+            <Undo2 size={18} strokeWidth={1.8} />
+          </IconButton>
+          <IconButton
+            label="Redo"
+            disabled={state.future.length === 0}
+            onClick={() => dispatch({ type: "redo" })}
+          >
+            <Redo2 size={18} strokeWidth={1.8} />
+          </IconButton>
+          <div className="hidden h-px w-9 bg-[#c7aa8e] lg:block" />
+          <IconButton label="Zoom in" onClick={() => zoomAroundCenter(1.12)}>
+            <Plus size={18} strokeWidth={1.8} />
+          </IconButton>
+          <IconButton label="Zoom out" onClick={() => zoomAroundCenter(0.88)}>
+            <Minus size={18} strokeWidth={1.8} />
+          </IconButton>
+          <IconButton label="Fit canvas" onClick={fitView}>
+            <Maximize2 size={18} strokeWidth={1.8} />
+          </IconButton>
+          <IconButton label="Rotate canvas 90 degrees" onClick={() => rotateViewBy(90)}>
+            <RotateCw size={18} strokeWidth={1.8} />
+          </IconButton>
+          <div className="hidden h-px w-9 bg-[#c7aa8e] lg:block" />
+          <IconButton label="Export PNG" disabled={exporting} onClick={exportPng}>
+            <Download size={18} strokeWidth={1.8} />
+          </IconButton>
+          <IconButton label="Reset canvas" onClick={resetProject}>
+            <RotateCcw size={18} strokeWidth={1.8} />
+          </IconButton>
+        </aside>
+
+        <section className="order-1 flex min-h-[66dvh] min-w-0 flex-col rounded-lg border border-[#cfb69c] bg-[#f8f0e5] shadow-[0_20px_44px_-28px_rgba(87,55,35,0.36)] lg:order-2 lg:min-h-0">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#dec9b1] px-4 py-3">
+            <div className="min-w-0">
+              <h1 className="text-xl font-semibold tracking-tight text-[#332419]">
+                Needler
+              </h1>
+              <p className="text-sm text-[#765943]">
+                {project.canvas.cols} by {project.canvas.rows} holes,{" "}
+                {meshCount}-count canvas
+              </p>
+            </div>
+            <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-[0.08em] text-[#765943]">
+              <span className="h-2 w-2 rounded-full bg-[#6f8d62]" />
+              {state.hydrated ? "Saved locally" : "Loading"}
+            </div>
+          </div>
+
+          <div
+            ref={stageRef}
+            className="relative min-h-[560px] flex-1 overflow-hidden bg-[#d6bd9f] touch-none lg:min-h-0"
+            onPointerDown={handlePointerDown}
+            onPointerMove={handlePointerMove}
+            onPointerUp={handlePointerUp}
+            onPointerCancel={() => {
+              setDrag(null);
+              setPanDrag(null);
+            }}
+            onWheel={handleWheel}
+          >
+            <div className="absolute inset-0 bg-[radial-gradient(circle_at_20%_18%,rgba(255,255,255,0.34),transparent_28%),linear-gradient(135deg,#dec4a4,#c59d75)]" />
+            <canvas ref={baseCanvasRef} className="absolute inset-0" />
+            <canvas ref={stitchCanvasRef} className="absolute inset-0" />
+            <canvas ref={previewCanvasRef} className="absolute inset-0" />
+            {project.stitches.length === 0 ? (
+              <div className="pointer-events-none absolute left-4 top-4 max-w-[230px] rounded-md border border-[#e2cbb2] bg-[#fff8ef]/88 px-3 py-2 text-sm text-[#765943] shadow-[0_12px_30px_-24px_rgba(58,35,22,0.42)]">
+                No stitches yet
+              </div>
+            ) : null}
+            {notice ? (
+              <div
+                className={[
+                  "pointer-events-none absolute bottom-4 left-4 max-w-[280px] rounded-md border px-3 py-2 text-sm font-medium shadow-[0_12px_30px_-22px_rgba(58,35,22,0.48)]",
+                  notice.tone === "warn"
+                    ? "border-[#cfa098] bg-[#fff3ef] text-[#8a332c]"
+                    : notice.tone === "success"
+                      ? "border-[#b8c59e] bg-[#f4f8ed] text-[#536842]"
+                      : "border-[#e2cbb2] bg-[#fff8ef] text-[#765943]",
+                ].join(" ")}
+              >
+                {notice.message}
+              </div>
+            ) : null}
+            <div className="pointer-events-none absolute right-4 top-4 grid gap-1 rounded-md border border-[#e2cbb2] bg-[#fff8ef]/88 px-3 py-2 text-right font-mono text-xs text-[#765943]">
+              <span>{Math.round(view.zoom * 100)}%</span>
+              <span>{Math.round(view.rotation)} deg</span>
+            </div>
+          </div>
+        </section>
+
+        <aside className="order-3 flex flex-col gap-4 rounded-lg border border-[#d6bfa6] bg-[#fff8ef] p-4 shadow-[0_20px_44px_-30px_rgba(87,55,35,0.32)] lg:max-h-[calc(100dvh-2rem)] lg:overflow-auto">
+          <section>
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-semibold uppercase tracking-[0.1em] text-[#765943]">
+                  Thread
+                </h2>
+                <p className="mt-1 text-sm text-[#4f392b]">
+                  {selectedColor ? getPaletteLabel(selectedColor) : "Select a color"}
+                </p>
+                {selectedColor ? (
+                  <p className="mt-1 font-mono text-xs uppercase text-[#8a6c55]">
+                    {selectedColor.hex}
+                  </p>
+                ) : null}
+              </div>
+              <div
+                className="h-10 w-10 rounded-md border border-[#cdb39a] shadow-[inset_0_1px_0_rgba(255,255,255,0.38)]"
+                style={{ backgroundColor: activePreviewColor }}
+              />
+            </div>
+
+            <div className="mt-4 grid grid-cols-7 gap-2">
+              {project.palette.map((color) => (
+                <button
+                  key={color.id}
+                  type="button"
+                  aria-label={`Select ${getPaletteLabel(color)}`}
+                  title={getPaletteLabel(color)}
+                  className={[
+                    "h-9 rounded-md border transition active:translate-y-px",
+                    selectedColorId === color.id
+                      ? "border-[#4f392b] ring-2 ring-[#7e4e36]/25"
+                      : "border-[#d6bfa6] hover:border-[#9d8064]",
+                  ].join(" ")}
+                  style={{ backgroundColor: color.hex }}
+                  onClick={() => setSelectedColorId(color.id)}
+                />
+              ))}
+            </div>
+          </section>
+
+          <section className="border-t border-[#e4d2bf] pt-4">
+            <h2 className="text-sm font-semibold uppercase tracking-[0.1em] text-[#765943]">
+              DMC library
+            </h2>
+            <label className="mt-3 grid gap-2 text-sm font-medium text-[#4f392b]">
+              Find floss
+              <input
+                type="search"
+                value={dmcQuery}
+                placeholder="3848, teal, old gold"
+                className="h-10 rounded-md border border-[#d8c4ad] bg-white px-3 text-sm outline-none transition placeholder:text-[#a58d74] focus:border-[#7e4e36]"
+                onChange={(event) => setDmcQuery(event.target.value)}
+              />
+            </label>
+            <div className="mt-3 grid max-h-64 gap-2 overflow-y-auto pr-1">
+              {filteredDmcColors.map((color) => {
+                const paletteId = dmcColorId(color.floss);
+                const isInPalette = paletteIds.has(paletteId);
+
+                return (
+                  <button
+                    key={color.floss}
+                    type="button"
+                    className={[
+                      "grid grid-cols-[28px_minmax(0,1fr)_auto] items-center gap-2 rounded-md border px-2 py-2 text-left transition active:translate-y-px",
+                      selectedColorId === paletteId
+                        ? "border-[#4f392b] bg-[#fff3e2]"
+                        : "border-[#e0ccb6] bg-white hover:border-[#b99b7d]",
+                    ].join(" ")}
+                    onClick={() => addDmcColor(color)}
+                  >
+                    <span
+                      className="h-7 w-7 rounded border border-[#d0b69c]"
+                      style={{ backgroundColor: color.hex }}
+                    />
+                    <span className="min-w-0">
+                      <span className="block font-mono text-xs text-[#765943]">
+                        DMC {color.floss}
+                      </span>
+                      <span className="block truncate text-sm font-medium text-[#3d2b1f]">
+                        {color.name}
+                      </span>
+                    </span>
+                    <span className="text-xs font-medium uppercase tracking-[0.08em] text-[#8a6c55]">
+                      {isInPalette ? "Use" : "Add"}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            <p className="mt-2 font-mono text-xs text-[#8a6c55]">
+              {DMC_COLORS.length} DMC colors
+            </p>
+          </section>
+
+          <section className="border-t border-[#e4d2bf] pt-4">
+            <h2 className="text-sm font-semibold uppercase tracking-[0.1em] text-[#765943]">
+              Reference image
+            </h2>
+            <div className="mt-3 grid gap-3">
+              <label className={`${panelButtonClass()} cursor-pointer`}>
+                <ImagePlus size={16} strokeWidth={1.8} />
+                {referenceImage ? "Replace image" : "Upload image"}
+                <input
+                  type="file"
+                  accept="image/*"
+                  className="sr-only"
+                  onChange={handleReferenceUpload}
+                />
+              </label>
+              {referenceImage ? (
+                <>
+                  <div className="rounded-md border border-[#e4d2bf] bg-white/70 px-3 py-2">
+                    <p className="truncate text-sm font-medium text-[#3d2b1f]">
+                      {referenceImage.name}
+                    </p>
+                    <p className="mt-1 font-mono text-xs text-[#8a6c55]">
+                      {referenceImage.width && referenceImage.height
+                        ? `${referenceImage.width} x ${referenceImage.height} px`
+                        : "Loading image"}
+                    </p>
+                  </div>
+                  <label className="flex flex-col gap-2 text-sm font-medium text-[#4f392b]">
+                    Opacity
+                    <input
+                      type="range"
+                      min="0.1"
+                      max="0.85"
+                      step="0.05"
+                      value={referenceImage.opacity}
+                      className="accent-[#7e4e36]"
+                      onChange={(event) =>
+                        setReferenceImage((current) =>
+                          current
+                            ? {
+                                ...current,
+                                opacity: Number(event.target.value),
+                              }
+                            : current,
+                        )
+                      }
+                    />
+                  </label>
+                  <div className="grid grid-cols-[1fr_auto] items-center gap-2">
+                    <p className="font-mono text-xs text-[#765943]">
+                      {Math.round(referenceImage.opacity * 100)}% overlay
+                    </p>
+                    <button
+                      type="button"
+                      className={panelButtonClass()}
+                      onClick={clearReferenceImage}
+                    >
+                      <ImageOff size={16} strokeWidth={1.8} />
+                      Clear
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <p className="text-xs leading-5 text-[#8a6c55]">
+                  Trace from a photo or sketch beneath the canvas grid.
+                </p>
+              )}
+            </div>
+          </section>
+
+          <section className="border-t border-[#e4d2bf] pt-4">
+            <h2 className="text-sm font-semibold uppercase tracking-[0.1em] text-[#765943]">
+              Canvas rotation
+            </h2>
+            <div className="mt-3 grid gap-3">
+              <div className="grid grid-cols-3 gap-2">
+                <button
+                  type="button"
+                  className={panelButtonClass()}
+                  onClick={() => rotateViewBy(-90)}
+                >
+                  <RotateCcw size={16} strokeWidth={1.8} />
+                  -90
+                </button>
+                <button
+                  type="button"
+                  className={panelButtonClass()}
+                  onClick={() => changeViewRotation(0)}
+                >
+                  0 deg
+                </button>
+                <button
+                  type="button"
+                  className={panelButtonClass()}
+                  onClick={() => rotateViewBy(90)}
+                >
+                  <RotateCw size={16} strokeWidth={1.8} />
+                  90
+                </button>
+              </div>
+              <label className="flex flex-col gap-2 text-sm font-medium text-[#4f392b]">
+                Free rotation
+                <input
+                  type="range"
+                  min="-180"
+                  max="180"
+                  step="1"
+                  value={view.rotation}
+                  className="accent-[#7e4e36]"
+                  onChange={(event) => changeViewRotation(Number(event.target.value))}
+                />
+              </label>
+              <div className="flex items-center justify-between gap-2 font-mono text-xs text-[#765943]">
+                <span>{Math.round(view.rotation)} deg</span>
+                <button
+                  type="button"
+                  className="text-xs font-medium uppercase tracking-[0.08em] text-[#7e4e36] underline-offset-4 hover:underline"
+                  onClick={fitView}
+                >
+                  Fit rotated view
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <section className="border-t border-[#e4d2bf] pt-4">
+            <h2 className="text-sm font-semibold uppercase tracking-[0.1em] text-[#765943]">
+              Canvas realism
+            </h2>
+            <div className="mt-3 grid gap-3">
+              <label className="grid gap-2 text-sm font-medium text-[#4f392b]">
+                Mesh count
+                <select
+                  value={meshCount}
+                  className="h-10 rounded-md border border-[#d8c4ad] bg-white px-3 text-sm outline-none transition focus:border-[#7e4e36]"
+                  onChange={(event) => changeMeshCount(Number(event.target.value))}
+                >
+                  {MESH_OPTIONS.map((option) => (
+                    <option key={option} value={option}>
+                      {option} holes per inch
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="grid grid-cols-2 gap-2 rounded-md border border-[#e4d2bf] bg-white/70 px-3 py-2 font-mono text-xs text-[#765943]">
+                <span>{physicalWidth.toFixed(2)} in wide</span>
+                <span>{physicalHeight.toFixed(2)} in high</span>
+              </div>
+              <label className="flex flex-col gap-2 text-sm font-medium text-[#4f392b]">
+                DMC strands
+                <input
+                  type="range"
+                  min="1"
+                  max="8"
+                  value={strandCount}
+                  className="accent-[#7e4e36]"
+                  onChange={(event) => setStrandCount(Number(event.target.value))}
+                />
+              </label>
+              <div className="font-mono text-xs text-[#765943]">
+                {strandCount} strands, {coveragePercent}% pitch coverage
+              </div>
+              {meshCount <= 10 ? (
+                <p className="text-xs leading-5 text-[#8a6c55]">
+                  Low-count plastic canvas is yarn territory; DMC floss will
+                  intentionally leave more open canvas.
+                </p>
+              ) : (
+                <p className="text-xs leading-5 text-[#8a6c55]">
+                  6 to 8 strands should visually fill 13 to 14 mesh.
+                </p>
+              )}
+            </div>
+          </section>
+
+          <section className="border-t border-[#e4d2bf] pt-4">
+            <h2 className="text-sm font-semibold uppercase tracking-[0.1em] text-[#765943]">
+              Custom color
+            </h2>
+            <div className="mt-3 grid gap-3">
+              <label className="grid gap-2 text-sm font-medium text-[#4f392b]">
+                Name
+                <input
+                  type="text"
+                  value={customName}
+                  className="h-10 rounded-md border border-[#d8c4ad] bg-white px-3 text-sm outline-none transition focus:border-[#7e4e36]"
+                  onChange={(event) => setCustomName(event.target.value)}
+                />
+              </label>
+              <label className="grid gap-2 text-sm font-medium text-[#4f392b]">
+                Color
+                <input
+                  type="color"
+                  value={customHex}
+                  className="h-10 w-full rounded-md border border-[#d8c4ad] bg-white p-1"
+                  onChange={(event) => setCustomHex(event.target.value)}
+                />
+              </label>
+              <button type="button" className={panelButtonClass()} onClick={addCustomColor}>
+                <Plus size={16} strokeWidth={1.8} />
+                Add thread
+              </button>
+            </div>
+          </section>
+
+          <section className="border-t border-[#e4d2bf] pt-4">
+            <h2 className="text-sm font-semibold uppercase tracking-[0.1em] text-[#765943]">
+              Project
+            </h2>
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                className={panelButtonClass("solid")}
+                disabled={exporting}
+                onClick={exportPng}
+              >
+                <Download size={16} strokeWidth={1.8} />
+                {exporting ? "Exporting" : "PNG"}
+              </button>
+              <button type="button" className={panelButtonClass()} onClick={resetProject}>
+                <RotateCcw size={16} strokeWidth={1.8} />
+                Reset
+              </button>
+            </div>
+            <dl className="mt-4 grid grid-cols-2 gap-3 border-t border-[#e4d2bf] pt-4 text-sm">
+              <div>
+                <dt className="text-xs uppercase tracking-[0.1em] text-[#8a6c55]">
+                  Stitches
+                </dt>
+                <dd className="mt-1 font-mono text-lg text-[#38271d]">
+                  {project.stitches.length}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-xs uppercase tracking-[0.1em] text-[#8a6c55]">
+                  Colors
+                </dt>
+                <dd className="mt-1 font-mono text-lg text-[#38271d]">
+                  {project.palette.length}
+                </dd>
+              </div>
+            </dl>
+          </section>
+        </aside>
+      </div>
+    </main>
+  );
+}
