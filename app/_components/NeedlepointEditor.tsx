@@ -1,22 +1,55 @@
 "use client";
 
 import {
+  Check,
+  Crop,
   Download,
   Eraser,
+  FileText,
   ImageOff,
   ImagePlus,
+  Layers3,
   Maximize2,
   Minus,
   Move,
   PenLine,
+  Pipette,
   Plus,
   Redo2,
   RotateCcw,
   RotateCw,
+  ScanLine,
   Undo2,
+  X,
 } from "lucide-react";
 import { DMC_COLORS } from "@/app/_data/dmcColors";
 import type { DmcColor } from "@/app/_data/dmcColors";
+import {
+  LEGACY_PROJECT_STORAGE_KEY,
+  PROJECT_STORAGE_KEY,
+  deserializeProject,
+  serializeProject,
+} from "@/app/_lib/persistence";
+import type { PatternPdfProgress } from "@/app/_lib/patternPdf";
+import {
+  MAX_HOLE_STRAND_UNITS,
+  canAddStitch,
+  canAddStitchWithLoadMap,
+  getHoleLoadMap,
+  holeKey,
+} from "@/app/_lib/needlepointRules";
+import type {
+  Hole,
+  PaletteColor,
+  PatternDirection,
+  PatternDraft,
+  PatternPaperSize,
+  PatternProgress,
+  PatternSettings,
+  Project,
+  ReferenceTransform,
+  Stitch,
+} from "@/app/_lib/needlepointTypes";
 import {
   useCallback,
   useEffect,
@@ -27,37 +60,7 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 
-type Hole = { col: number; row: number };
-type Stitch = {
-  id: string;
-  from: Hole;
-  to: Hole;
-  colorId: string;
-  thickness: number;
-  strands?: number;
-};
-type PaletteColor = {
-  id: string;
-  name: string;
-  hex: string;
-  floss?: string;
-  source?: "dmc" | "custom";
-};
-type Project = {
-  version: 1;
-  canvas: {
-    cols: number;
-    rows: number;
-    meshCount: number;
-    widthIn: number;
-    heightIn: number;
-    material: "perforated-paper";
-  };
-  palette: PaletteColor[];
-  stitches: Stitch[];
-};
-
-type Tool = "stitch" | "erase" | "pan";
+type Tool = "stitch" | "erase" | "pan" | "image" | "eyedropper";
 type Point = { x: number; y: number };
 type ViewState = { zoom: number; pan: Point; rotation: number };
 type ReferenceImageState = {
@@ -66,7 +69,10 @@ type ReferenceImageState = {
   opacity: number;
   width: number | null;
   height: number | null;
+  fit: "fit" | "fill";
+  transform: ReferenceTransform;
 };
+type PreviewMode = "image" | "pattern" | "both";
 type DragState = { from: Hole; to: Hole | null } | null;
 type PanDragState =
   | {
@@ -75,28 +81,29 @@ type PanDragState =
       origin: Point;
     }
   | null;
+type ImageDragState =
+  | {
+      pointerId: number;
+      startWorld: Point;
+      origin: Point;
+    }
+  | null;
 type NoticeTone = "info" | "warn" | "success";
 type Notice = { id: number; message: string; tone: NoticeTone };
+type PatternJobState =
+  | { status: "idle" }
+  | { status: "working"; progress: PatternProgress }
+  | { status: "error"; message: string };
+type PdfJobState =
+  | { status: "idle" }
+  | { status: "working"; progress: PatternPdfProgress }
+  | { status: "error"; message: string };
 type HoleFill = {
   load: number;
   red: number;
   green: number;
   blue: number;
 };
-type HoleCapacityCheck =
-  | {
-      canAdd: true;
-      fromLoad: number;
-      toLoad: number;
-    }
-  | {
-      canAdd: false;
-      fromLoad: number;
-      toLoad: number;
-      blockedHole: Hole;
-      blockedLoad: number;
-    };
-
 type EditorState = {
   project: Project;
   past: Project[];
@@ -110,20 +117,26 @@ type EditorAction =
   | { type: "undo" }
   | { type: "redo" };
 
-const STORAGE_KEY = "needler.project.v1";
 const MAX_HISTORY = 100;
 const SHEET_WIDTH_IN = 9;
 const SHEET_HEIGHT_IN = 12;
 const SHEET_MESH_COUNT = 14;
 const SHEET_COLS = SHEET_WIDTH_IN * SHEET_MESH_COUNT + 1;
 const SHEET_ROWS = SHEET_HEIGHT_IN * SHEET_MESH_COUNT + 1;
-const MAX_HOLE_STRAND_UNITS = 18;
 const DEFAULT_STRAND_COUNT = 6;
 const DISPLAY_PIXELS_PER_INCH = 252;
 const DMC_STRAND_DIAMETER_INCH = 0.0265;
 const MIN_ZOOM = 0.12;
 const MAX_ZOOM = 2.7;
 const EXPORT_SCALE = 3;
+const PATTERN_SAMPLE_SCALE = 4;
+const DEFAULT_PATTERN_SETTINGS: PatternSettings = {
+  maxColors: 16,
+  detail: "medium",
+  strands: DEFAULT_STRAND_COUNT,
+  direction: "slash",
+  backgroundTolerance: 10,
+};
 
 const DMC_BY_FLOSS = new Map(DMC_COLORS.map((color) => [color.floss, color]));
 const DEFAULT_DMC_FLOSS = [
@@ -462,29 +475,6 @@ function sameHole(a: Hole | null, b: Hole | null) {
   return Boolean(a && b && a.col === b.col && a.row === b.row);
 }
 
-function holeKey(hole: Hole) {
-  return `${hole.col}:${hole.row}`;
-}
-
-function getHoleLoad(loadMap: Map<string, number>, hole: Hole) {
-  return loadMap.get(holeKey(hole)) ?? 0;
-}
-
-function getHoleLoadMap(project: Project) {
-  const loadMap = new Map<string, number>();
-
-  for (const stitch of project.stitches) {
-    const strands = getStitchStrands(stitch);
-
-    for (const hole of [stitch.from, stitch.to]) {
-      const key = holeKey(hole);
-      loadMap.set(key, (loadMap.get(key) ?? 0) + strands);
-    }
-  }
-
-  return loadMap;
-}
-
 function addHoleFill(
   fillMap: Map<string, HoleFill>,
   hole: Hole,
@@ -524,48 +514,6 @@ function getHoleFillMap(
   return fillMap;
 }
 
-function canAddStitchWithLoadMap(
-  loadMap: Map<string, number>,
-  from: Hole,
-  to: Hole,
-  strands: number,
-): HoleCapacityCheck {
-  const strandUnits = clamp(Math.round(strands), 1, 8);
-  const fromLoad = getHoleLoad(loadMap, from);
-  const toLoad = getHoleLoad(loadMap, to);
-
-  if (fromLoad + strandUnits > MAX_HOLE_STRAND_UNITS) {
-    return {
-      canAdd: false,
-      fromLoad,
-      toLoad,
-      blockedHole: from,
-      blockedLoad: fromLoad,
-    };
-  }
-
-  if (toLoad + strandUnits > MAX_HOLE_STRAND_UNITS) {
-    return {
-      canAdd: false,
-      fromLoad,
-      toLoad,
-      blockedHole: to,
-      blockedLoad: toLoad,
-    };
-  }
-
-  return { canAdd: true, fromLoad, toLoad };
-}
-
-function canAddStitch(
-  project: Project,
-  from: Hole,
-  to: Hole,
-  strands: number,
-) {
-  return canAddStitchWithLoadMap(getHoleLoadMap(project), from, to, strands);
-}
-
 function getClientPoint(
   event: { clientX: number; clientY: number },
   stage: HTMLElement | null,
@@ -588,23 +536,6 @@ function clamp(value: number, min: number, max: number) {
 
 function buildPaletteMap(palette: PaletteColor[]) {
   return new Map(palette.map((color) => [color.id, color]));
-}
-
-function isProject(value: unknown): value is Project {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-
-  const candidate = value as Project;
-
-  return (
-    candidate.version === 1 &&
-    Boolean(candidate.canvas) &&
-    Number.isInteger(candidate.canvas.cols) &&
-    Number.isInteger(candidate.canvas.rows) &&
-    Array.isArray(candidate.palette) &&
-    Array.isArray(candidate.stitches)
-  );
 }
 
 function hexToRgb(hex: string) {
@@ -688,11 +619,24 @@ function prepareCanvas(
   return ctx;
 }
 
+function getPatternBounds(canvas: Project["canvas"]) {
+  const spacing = getGridSpacing(canvas);
+  const padding = getGridPadding(canvas);
+
+  return {
+    x: padding,
+    y: padding,
+    width: (canvas.cols - 1) * spacing,
+    height: (canvas.rows - 1) * spacing,
+  };
+}
+
 function drawReferenceImage(
   ctx: CanvasRenderingContext2D,
   image: HTMLImageElement,
-  world: { width: number; height: number },
-  opacity: number,
+  target: { x: number; y: number; width: number; height: number },
+  reference: ReferenceImageState,
+  opacity = reference.opacity,
 ) {
   const imageWidth = image.naturalWidth || image.width;
   const imageHeight = image.naturalHeight || image.height;
@@ -701,24 +645,46 @@ function drawReferenceImage(
     return;
   }
 
-  const scale = Math.min(world.width / imageWidth, world.height / imageHeight);
-  const width = imageWidth * scale;
-  const height = imageHeight * scale;
-  const x = (world.width - width) / 2;
-  const y = (world.height - height) / 2;
+  const isQuarterTurn = reference.transform.rotation % 180 !== 0;
+  const rotatedWidth = isQuarterTurn ? imageHeight : imageWidth;
+  const rotatedHeight = isQuarterTurn ? imageWidth : imageHeight;
+  const fitScale = Math.min(
+    target.width / rotatedWidth,
+    target.height / rotatedHeight,
+  );
+  const fillScale = Math.max(
+    target.width / rotatedWidth,
+    target.height / rotatedHeight,
+  );
+  const scale =
+    (reference.fit === "fit" ? fitScale : fillScale) * reference.transform.scale;
 
   ctx.save();
+  ctx.beginPath();
+  ctx.rect(target.x, target.y, target.width, target.height);
+  ctx.clip();
   ctx.globalAlpha = clamp(opacity, 0, 1);
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(image, x, y, width, height);
+  ctx.translate(
+    target.x + target.width / 2 + reference.transform.translateX * target.width,
+    target.y + target.height / 2 + reference.transform.translateY * target.height,
+  );
+  ctx.rotate(degreesToRadians(reference.transform.rotation));
+  ctx.drawImage(
+    image,
+    (-imageWidth * scale) / 2,
+    (-imageHeight * scale) / 2,
+    imageWidth * scale,
+    imageHeight * scale,
+  );
   ctx.restore();
 }
 
 function drawPerforatedSheet(
   ctx: CanvasRenderingContext2D,
   project: Project,
-  referenceImage?: { image: HTMLImageElement; opacity: number } | null,
+  referenceImage?: { image: HTMLImageElement; state: ReferenceImageState } | null,
 ) {
   const world = getWorldSize(project.canvas);
   const holeRadius = getHoleRadius(project.canvas);
@@ -744,7 +710,12 @@ function drawPerforatedSheet(
   ctx.fillRect(0, 0, world.width, world.height);
 
   if (referenceImage) {
-    drawReferenceImage(ctx, referenceImage.image, world, referenceImage.opacity);
+    drawReferenceImage(
+      ctx,
+      referenceImage.image,
+      getPatternBounds(project.canvas),
+      referenceImage.state,
+    );
   }
 
   for (let y = 8; y < world.height; y += 13) {
@@ -911,7 +882,78 @@ function drawHoleThreadFill(
   }
 }
 
+type DenseStitchGroup = {
+  path: Path2D;
+  color: string;
+  width: number;
+};
+
+const denseStitchCache = new WeakMap<Project, DenseStitchGroup[]>();
+const denseHoleFillCache = new WeakMap<Project, Map<string, HoleFill>>();
+const draftPathCache = new WeakMap<PatternDraft, DenseStitchGroup[]>();
+
+function getDenseStitchGroups(project: Project) {
+  const cached = denseStitchCache.get(project);
+  if (cached) return cached;
+
+  const paletteMap = buildPaletteMap(project.palette);
+  const groups = new Map<string, DenseStitchGroup>();
+
+  for (const stitch of project.stitches) {
+    const color = paletteMap.get(stitch.colorId)?.hex ?? project.palette[0]?.hex;
+    if (!color) continue;
+    const width = getStitchWidth(stitch);
+    const key = `${color}:${width.toFixed(2)}`;
+    const group = groups.get(key) ?? { path: new Path2D(), color, width };
+    const start = holeToWorld(stitch.from, project.canvas);
+    const end = holeToWorld(stitch.to, project.canvas);
+    group.path.moveTo(start.x, start.y);
+    group.path.lineTo(end.x, end.y);
+    groups.set(key, group);
+  }
+
+  const result = [...groups.values()];
+  denseStitchCache.set(project, result);
+  return result;
+}
+
+function drawDenseStitches(ctx: CanvasRenderingContext2D, project: Project) {
+  const groups = getDenseStitchGroups(project);
+
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  for (const group of groups) {
+    ctx.save();
+    ctx.shadowColor = "rgba(56, 33, 21, 0.2)";
+    ctx.shadowBlur = 2;
+    ctx.shadowOffsetY = 1.1;
+    ctx.strokeStyle = rgba(group.color, 0.42);
+    ctx.lineWidth = group.width + 2.2;
+    ctx.stroke(group.path);
+    ctx.restore();
+
+    ctx.strokeStyle = group.color;
+    ctx.lineWidth = group.width;
+    ctx.stroke(group.path);
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.2)";
+    ctx.lineWidth = Math.max(0.8, group.width * 0.12);
+    ctx.stroke(group.path);
+  }
+  ctx.restore();
+
+  const fillMap =
+    denseHoleFillCache.get(project) ?? getHoleFillMap(project, buildPaletteMap(project.palette));
+  denseHoleFillCache.set(project, fillMap);
+  drawHoleThreadFill(ctx, project, fillMap);
+}
+
 function drawStitches(ctx: CanvasRenderingContext2D, project: Project) {
+  if (project.stitches.length > 1200) {
+    drawDenseStitches(ctx, project);
+    return;
+  }
+
   const paletteMap = buildPaletteMap(project.palette);
 
   for (const stitch of project.stitches) {
@@ -923,6 +965,77 @@ function drawStitches(ctx: CanvasRenderingContext2D, project: Project) {
   }
 
   drawHoleThreadFill(ctx, project, getHoleFillMap(project, paletteMap));
+}
+
+function getPatternStitchHoles(
+  col: number,
+  row: number,
+  direction: PatternDirection,
+) {
+  return direction === "slash"
+    ? {
+        from: { col, row: row + 1 },
+        to: { col: col + 1, row },
+      }
+    : {
+        from: { col, row },
+        to: { col: col + 1, row: row + 1 },
+      };
+}
+
+function getDraftGroups(draft: PatternDraft, canvas: Project["canvas"]) {
+  const cached = draftPathCache.get(draft);
+  if (cached) return cached;
+  const groups = draft.colors.map((usage) => ({
+    path: new Path2D(),
+    color: usage.color.hex,
+    width: getThreadWidthForStrands(draft.settings.strands),
+  }));
+
+  for (let index = 0; index < draft.cells.length; index += 1) {
+    const colorIndex = draft.cells[index];
+    if (colorIndex === 0) continue;
+    const col = index % draft.cols;
+    const row = Math.floor(index / draft.cols);
+    const holes = getPatternStitchHoles(col, row, draft.settings.direction);
+    const start = holeToWorld(holes.from, canvas);
+    const end = holeToWorld(holes.to, canvas);
+    const path = groups[colorIndex - 1]?.path;
+    if (!path) continue;
+    path.moveTo(start.x, start.y);
+    path.lineTo(end.x, end.y);
+  }
+
+  draftPathCache.set(draft, groups);
+  return groups;
+}
+
+function drawPatternDraft(
+  ctx: CanvasRenderingContext2D,
+  draft: PatternDraft,
+  canvas: Project["canvas"],
+) {
+  ctx.save();
+  ctx.globalAlpha = 0.9;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  for (const group of getDraftGroups(draft, canvas)) {
+    ctx.save();
+    ctx.shadowColor = "rgba(56, 33, 21, 0.2)";
+    ctx.shadowBlur = 2;
+    ctx.shadowOffsetY = 1.1;
+    ctx.strokeStyle = rgba(group.color, 0.38);
+    ctx.lineWidth = group.width + 2.1;
+    ctx.stroke(group.path);
+    ctx.restore();
+    ctx.strokeStyle = group.color;
+    ctx.lineWidth = group.width;
+    ctx.stroke(group.path);
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.2)";
+    ctx.lineWidth = Math.max(0.8, group.width * 0.11);
+    ctx.stroke(group.path);
+  }
+  ctx.restore();
 }
 
 function hashString(value: string) {
@@ -958,6 +1071,38 @@ function distanceToSegment(point: Point, start: Point, end: Point) {
   return Math.hypot(point.x - projection.x, point.y - projection.y);
 }
 
+type StitchSpatialIndex = Map<string, Stitch[]>;
+const stitchSpatialCache = new WeakMap<Project, StitchSpatialIndex>();
+
+function getStitchSpatialIndex(project: Project) {
+  const cached = stitchSpatialCache.get(project);
+  if (cached) return cached;
+  const index: StitchSpatialIndex = new Map();
+
+  for (const stitch of project.stitches) {
+    const colDelta = stitch.to.col - stitch.from.col;
+    const rowDelta = stitch.to.row - stitch.from.row;
+    const steps = Math.max(Math.abs(colDelta), Math.abs(rowDelta), 1);
+    const keys = new Set<string>();
+
+    for (let step = 0; step <= steps; step += 1) {
+      const ratio = step / steps;
+      const col = Math.floor(stitch.from.col + colDelta * ratio);
+      const row = Math.floor(stitch.from.row + rowDelta * ratio);
+      keys.add(`${col}:${row}`);
+    }
+
+    for (const key of keys) {
+      const bucket = index.get(key) ?? [];
+      bucket.push(stitch);
+      index.set(key, bucket);
+    }
+  }
+
+  stitchSpatialCache.set(project, index);
+  return index;
+}
+
 function findNearestStitch(
   point: Point,
   project: Project,
@@ -965,8 +1110,22 @@ function findNearestStitch(
 ): Stitch | null {
   let nearest: { stitch: Stitch; distance: number } | null = null;
   const screenDistance = 13 / view.zoom;
+  const spacing = getGridSpacing(project.canvas);
+  const padding = getGridPadding(project.canvas);
+  const col = Math.floor((point.x - padding) / spacing);
+  const row = Math.floor((point.y - padding) / spacing);
+  const candidates = new Map<string, Stitch>();
+  const spatialIndex = getStitchSpatialIndex(project);
 
-  for (const stitch of project.stitches) {
+  for (let rowOffset = -1; rowOffset <= 1; rowOffset += 1) {
+    for (let colOffset = -1; colOffset <= 1; colOffset += 1) {
+      for (const stitch of spatialIndex.get(`${col + colOffset}:${row + rowOffset}`) ?? []) {
+        candidates.set(stitch.id, stitch);
+      }
+    }
+  }
+
+  for (const stitch of candidates.values()) {
     const distance = distanceToSegment(
       point,
       holeToWorld(stitch.from, project.canvas),
@@ -995,6 +1154,101 @@ function makeStitch(from: Hole, to: Hole, colorId: string, strands: number) {
   };
 }
 
+function unitDiagonalCellKey(stitch: Stitch) {
+  const colDelta = Math.abs(stitch.to.col - stitch.from.col);
+  const rowDelta = Math.abs(stitch.to.row - stitch.from.row);
+  return colDelta === 1 && rowDelta === 1
+    ? `${Math.min(stitch.from.col, stitch.to.col)}:${Math.min(
+        stitch.from.row,
+        stitch.to.row,
+      )}`
+    : null;
+}
+
+function addStitchLoad(loadMap: Map<string, number>, hole: Hole, strands: number) {
+  const key = holeKey(hole);
+  loadMap.set(key, (loadMap.get(key) ?? 0) + strands);
+}
+
+function applyPatternDraft(
+  project: Project,
+  draft: PatternDraft,
+  mode: "replace" | "fill",
+) {
+  const baseStitches = mode === "replace" ? [] : project.stitches;
+  const occupied = new Set(
+    mode === "fill"
+      ? project.stitches
+          .map(unitDiagonalCellKey)
+          .filter((key): key is string => Boolean(key))
+      : [],
+  );
+  const loadMap = mode === "replace" ? new Map<string, number>() : getHoleLoadMap(project);
+  const additions: Stitch[] = [];
+  const usedColorIds = new Set<string>();
+  let occupiedSkipped = 0;
+  let capacitySkipped = 0;
+  const batchId = Date.now().toString(36);
+
+  for (let index = 0; index < draft.cells.length; index += 1) {
+    const colorIndex = draft.cells[index];
+    if (colorIndex === 0) continue;
+    const col = index % draft.cols;
+    const row = Math.floor(index / draft.cols);
+    const cellKey = `${col}:${row}`;
+
+    if (occupied.has(cellKey)) {
+      occupiedSkipped += 1;
+      continue;
+    }
+
+    const color = draft.colors[colorIndex - 1]?.color;
+    if (!color) continue;
+    const holes = getPatternStitchHoles(col, row, draft.settings.direction);
+    const capacity = canAddStitchWithLoadMap(
+      loadMap,
+      holes.from,
+      holes.to,
+      draft.settings.strands,
+    );
+
+    if (!capacity.canAdd) {
+      capacitySkipped += 1;
+      continue;
+    }
+
+    additions.push({
+      id: `image-${batchId}-${index.toString(36)}`,
+      from: holes.from,
+      to: holes.to,
+      colorId: color.id,
+      strands: draft.settings.strands,
+      thickness: getThreadWidthForStrands(draft.settings.strands),
+    });
+    usedColorIds.add(color.id);
+    occupied.add(cellKey);
+    addStitchLoad(loadMap, holes.from, draft.settings.strands);
+    addStitchLoad(loadMap, holes.to, draft.settings.strands);
+  }
+
+  const paletteIds = new Set(project.palette.map((color) => color.id));
+  const addedColors = draft.colors
+    .map((usage) => usage.color)
+    .filter((color) => usedColorIds.has(color.id) && !paletteIds.has(color.id));
+
+  return {
+    project: {
+      ...project,
+      palette: [...project.palette, ...addedColors],
+      stitches: [...baseStitches, ...additions],
+    },
+    additions: additions.length,
+    occupiedSkipped,
+    capacitySkipped,
+    colorsAdded: addedColors.length,
+  };
+}
+
 function createExportCanvas(project: Project) {
   const world = getWorldSize(project.canvas);
   const canvas = document.createElement("canvas");
@@ -1013,6 +1267,70 @@ function createExportCanvas(project: Project) {
   drawStitches(ctx, project);
 
   return canvas;
+}
+
+function createPatternSampleCanvas(
+  image: HTMLImageElement,
+  reference: ReferenceImageState,
+  canvasModel: Project["canvas"],
+) {
+  const canvas = document.createElement("canvas");
+  canvas.width = (canvasModel.cols - 1) * PATTERN_SAMPLE_SCALE;
+  canvas.height = (canvasModel.rows - 1) * PATTERN_SAMPLE_SCALE;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+  if (!ctx) return null;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawReferenceImage(
+    ctx,
+    image,
+    { x: 0, y: 0, width: canvas.width, height: canvas.height },
+    reference,
+    1,
+  );
+  return canvas;
+}
+
+function sampleReferenceColor(
+  point: Point,
+  image: HTMLImageElement,
+  reference: ReferenceImageState,
+  canvasModel: Project["canvas"],
+) {
+  const bounds = getPatternBounds(canvasModel);
+  const normalizedX = (point.x - bounds.x) / bounds.width;
+  const normalizedY = (point.y - bounds.y) / bounds.height;
+
+  if (normalizedX < 0 || normalizedX > 1 || normalizedY < 0 || normalizedY > 1) {
+    return null;
+  }
+
+  const sampleCanvas = createPatternSampleCanvas(image, reference, canvasModel);
+  const ctx = sampleCanvas?.getContext("2d", { willReadFrequently: true });
+  if (!sampleCanvas || !ctx) return null;
+  const x = clamp(Math.floor(normalizedX * sampleCanvas.width), 0, sampleCanvas.width - 1);
+  const y = clamp(Math.floor(normalizedY * sampleCanvas.height), 0, sampleCanvas.height - 1);
+  const pixel = ctx.getImageData(x, y, 1, 1).data;
+  if (pixel[3] < 31) return null;
+  return `#${[pixel[0], pixel[1], pixel[2]]
+    .map((channel) => channel.toString(16).padStart(2, "0"))
+    .join("")}`;
+}
+
+async function createPdfPreviewPng(project: Project) {
+  const world = getWorldSize(project.canvas);
+  const canvas = document.createElement("canvas");
+  canvas.width = 450;
+  canvas.height = 600;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  const scale = Math.min(canvas.width / world.width, canvas.height / world.height);
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  drawPerforatedSheet(ctx, project);
+  drawStitches(ctx, project);
+
+  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+  return blob ? blob.arrayBuffer() : null;
 }
 
 function downloadBlob(blob: Blob, filename: string) {
@@ -1090,6 +1408,7 @@ export default function NeedlepointEditor() {
   const [tool, setTool] = useState<Tool>("stitch");
   const [drag, setDrag] = useState<DragState>(null);
   const [panDrag, setPanDrag] = useState<PanDragState>(null);
+  const [imageDrag, setImageDrag] = useState<ImageDragState>(null);
   const [hoverHole, setHoverHole] = useState<Hole | null>(null);
   const [hoveredStitchId, setHoveredStitchId] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -1105,12 +1424,23 @@ export default function NeedlepointEditor() {
   });
   const [referenceImage, setReferenceImage] =
     useState<ReferenceImageState | null>(null);
+  const [previewMode, setPreviewMode] = useState<PreviewMode>("both");
+  const [patternSettings, setPatternSettings] = useState<PatternSettings>(
+    DEFAULT_PATTERN_SETTINGS,
+  );
+  const [patternDraft, setPatternDraft] = useState<PatternDraft | null>(null);
+  const [patternJob, setPatternJob] = useState<PatternJobState>({ status: "idle" });
+  const [replaceConfirmed, setReplaceConfirmed] = useState(false);
+  const [paperSize, setPaperSize] = useState<PatternPaperSize>("letter");
+  const [pdfJob, setPdfJob] = useState<PdfJobState>({ status: "idle" });
 
   const stageRef = useRef<HTMLDivElement | null>(null);
   const baseCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const stitchCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const previewCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const referenceElementRef = useRef<HTMLImageElement | null>(null);
+  const patternWorkerRef = useRef<Worker | null>(null);
+  const pdfWorkerRef = useRef<Worker | null>(null);
   const hasFitViewRef = useRef(false);
 
   const meshCount = getMeshCount(project.canvas);
@@ -1133,6 +1463,7 @@ export default function NeedlepointEditor() {
     selectedColor?.id ?? project.palette[0]?.id ?? INITIAL_SELECTED_COLOR_ID;
   const activePreviewColor = selectedColor?.hex ?? "#559392";
   const referenceSrc = referenceImage?.src ?? null;
+  const newPatternColors = patternDraft?.colors.filter((usage) => !usage.existing) ?? [];
   const paletteIds = useMemo(
     () => new Set(project.palette.map((color) => color.id)),
     [project.palette],
@@ -1207,11 +1538,11 @@ export default function NeedlepointEditor() {
     let loadedProject: Project | null = null;
 
     try {
-      const savedProject = window.localStorage.getItem(STORAGE_KEY);
-
-      if (savedProject) {
-        const parsed = JSON.parse(savedProject) as unknown;
-        loadedProject = isProject(parsed) ? parsed : null;
+      for (const key of [PROJECT_STORAGE_KEY, LEGACY_PROJECT_STORAGE_KEY]) {
+        const savedProject = window.localStorage.getItem(key);
+        if (!savedProject) continue;
+        loadedProject = deserializeProject(JSON.parse(savedProject) as unknown);
+        if (loadedProject) break;
       }
     } catch {
       loadedProject = null;
@@ -1231,7 +1562,7 @@ export default function NeedlepointEditor() {
 
     const timeout = window.setTimeout(() => {
       try {
-        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(project));
+        window.localStorage.setItem(PROJECT_STORAGE_KEY, serializeProject(project));
       } catch {
         notify("Local storage is not available.", "warn");
       }
@@ -1249,6 +1580,13 @@ export default function NeedlepointEditor() {
 
     return () => window.clearTimeout(timeout);
   }, [notice]);
+
+  useEffect(() => {
+    return () => {
+      patternWorkerRef.current?.terminate();
+      pdfWorkerRef.current?.terminate();
+    };
+  }, []);
 
   useEffect(() => {
     if (!referenceSrc) {
@@ -1334,15 +1672,17 @@ export default function NeedlepointEditor() {
     drawPerforatedSheet(
       ctx,
       project,
-      referenceElementRef.current && referenceImage
+      referenceElementRef.current &&
+        referenceImage &&
+        previewMode !== "pattern"
         ? {
             image: referenceElementRef.current,
-            opacity: referenceImage.opacity,
+            state: referenceImage,
           }
         : null,
     );
     ctx.restore();
-  }, [project, referenceImage, view, viewport]);
+  }, [patternDraft, previewMode, project, referenceImage, view, viewport]);
 
   useEffect(() => {
     const ctx = prepareCanvas(stitchCanvasRef.current, viewport);
@@ -1353,9 +1693,11 @@ export default function NeedlepointEditor() {
 
     ctx.save();
     applyViewTransform(ctx, view, project.canvas);
-    drawStitches(ctx, project);
+    if (!patternDraft) {
+      drawStitches(ctx, project);
+    }
     ctx.restore();
-  }, [project, view, viewport]);
+  }, [patternDraft, project, view, viewport]);
 
   useEffect(() => {
     const ctx = prepareCanvas(previewCanvasRef.current, viewport);
@@ -1366,6 +1708,9 @@ export default function NeedlepointEditor() {
 
     ctx.save();
     applyViewTransform(ctx, view, project.canvas);
+    if (patternDraft && previewMode !== "image") {
+      drawPatternDraft(ctx, patternDraft, project.canvas);
+    }
     const dragCapacity =
       drag?.from && drag.to && !sameHole(drag.from, drag.to)
         ? canAddStitchWithLoadMap(holeLoadMap, drag.from, drag.to, strandCount)
@@ -1449,6 +1794,8 @@ export default function NeedlepointEditor() {
     hoveredStitchId,
     project.canvas,
     project.stitches,
+    patternDraft,
+    previewMode,
     strandCount,
     strandWidth,
     tool,
@@ -1483,6 +1830,7 @@ export default function NeedlepointEditor() {
       if (event.key === "Escape") {
         setDrag(null);
         setPanDrag(null);
+        setImageDrag(null);
       }
     };
 
@@ -1514,6 +1862,42 @@ export default function NeedlepointEditor() {
     }
 
     const worldPoint = screenToWorld(screenPoint, view, project.canvas);
+
+    if (tool === "image") {
+      if (!referenceImage) {
+        notify("Upload an image before framing it.", "warn");
+        return;
+      }
+      setPatternDraft(null);
+      setReplaceConfirmed(false);
+      setImageDrag({
+        pointerId: event.pointerId,
+        startWorld: worldPoint,
+        origin: {
+          x: referenceImage.transform.translateX,
+          y: referenceImage.transform.translateY,
+        },
+      });
+      return;
+    }
+
+    if (tool === "eyedropper") {
+      const image = referenceElementRef.current;
+      if (!referenceImage || !image) {
+        notify("Upload an image before choosing its background.", "warn");
+        return;
+      }
+      const color = sampleReferenceColor(worldPoint, image, referenceImage, project.canvas);
+      if (!color) {
+        notify("Choose an opaque point inside the image.", "warn");
+        return;
+      }
+      setPatternSettings((current) => ({ ...current, backgroundHex: color }));
+      setPatternDraft(null);
+      setTool("image");
+      notify(`Background sample ${color} selected.`, "success");
+      return;
+    }
 
     if (tool === "erase") {
       const target = findNearestStitch(worldPoint, project, view);
@@ -1562,6 +1946,27 @@ export default function NeedlepointEditor() {
 
     const worldPoint = screenToWorld(screenPoint, view, project.canvas);
 
+    if (imageDrag && imageDrag.pointerId === event.pointerId && referenceImage) {
+      const bounds = getPatternBounds(project.canvas);
+      setReferenceImage((current) =>
+        current
+          ? {
+              ...current,
+              transform: {
+                ...current.transform,
+                translateX:
+                  imageDrag.origin.x +
+                  (worldPoint.x - imageDrag.startWorld.x) / bounds.width,
+                translateY:
+                  imageDrag.origin.y +
+                  (worldPoint.y - imageDrag.startWorld.y) / bounds.height,
+              },
+            }
+          : current,
+      );
+      return;
+    }
+
     if (tool === "erase") {
       setHoverHole(nearestHole(worldPoint, project.canvas));
       setHoveredStitchId(findNearestStitch(worldPoint, project, view)?.id ?? null);
@@ -1579,6 +1984,11 @@ export default function NeedlepointEditor() {
   const handlePointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
     if (panDrag?.pointerId === event.pointerId) {
       setPanDrag(null);
+      return;
+    }
+
+    if (imageDrag?.pointerId === event.pointerId) {
+      setImageDrag(null);
       return;
     }
 
@@ -1620,6 +2030,24 @@ export default function NeedlepointEditor() {
 
   const handleWheel = (event: React.WheelEvent<HTMLDivElement>) => {
     event.preventDefault();
+
+    if (tool === "image" && referenceImage) {
+      const factor = event.deltaY > 0 ? 0.92 : 1.08;
+      setPatternDraft(null);
+      setReplaceConfirmed(false);
+      setReferenceImage((current) =>
+        current
+          ? {
+              ...current,
+              transform: {
+                ...current.transform,
+                scale: clamp(current.transform.scale * factor, 0.25, 4),
+              },
+            }
+          : current,
+      );
+      return;
+    }
 
     const screenPoint = getClientPoint(event, stageRef.current);
 
@@ -1667,6 +2095,8 @@ export default function NeedlepointEditor() {
     const nextProject = makeDefaultProject();
 
     commitProject(nextProject);
+    setPatternDraft(null);
+    setReplaceConfirmed(false);
     setSelectedColorId(INITIAL_SELECTED_COLOR_ID);
     setStrandCount(DEFAULT_STRAND_COUNT);
     fitViewToCanvas(nextProject.canvas);
@@ -1743,7 +2173,18 @@ export default function NeedlepointEditor() {
         opacity: 0.42,
         width: null,
         height: null,
+        fit: "fill",
+        transform: {
+          scale: 1,
+          translateX: 0,
+          translateY: 0,
+          rotation: 0,
+        },
       });
+      setPatternDraft(null);
+      setReplaceConfirmed(false);
+      setPreviewMode("both");
+      setTool("image");
       notify("Reference image loaded.", "success");
     };
 
@@ -1755,9 +2196,242 @@ export default function NeedlepointEditor() {
   };
 
   const clearReferenceImage = () => {
+    patternWorkerRef.current?.terminate();
+    patternWorkerRef.current = null;
     referenceElementRef.current = null;
     setReferenceImage(null);
+    setPatternDraft(null);
+    setPatternJob({ status: "idle" });
+    setReplaceConfirmed(false);
+    if (tool === "image" || tool === "eyedropper") setTool("stitch");
     notify("Reference image cleared.", "info");
+  };
+
+  const resetReferenceFrame = (fit: "fit" | "fill") => {
+    setReferenceImage((current) =>
+      current
+        ? {
+            ...current,
+            fit,
+            transform: {
+              ...current.transform,
+              scale: 1,
+              translateX: 0,
+              translateY: 0,
+            },
+          }
+        : current,
+    );
+    setPatternDraft(null);
+    setReplaceConfirmed(false);
+  };
+
+  const rotateReference = () => {
+    setReferenceImage((current) =>
+      current
+        ? {
+            ...current,
+            transform: {
+              ...current.transform,
+              rotation: ((current.transform.rotation + 90) % 360) as ReferenceTransform["rotation"],
+            },
+          }
+        : current,
+    );
+    setPatternDraft(null);
+    setReplaceConfirmed(false);
+  };
+
+  const cancelPatternPreview = () => {
+    patternWorkerRef.current?.terminate();
+    patternWorkerRef.current = null;
+    setPatternJob({ status: "idle" });
+    notify("Pattern conversion canceled.", "info");
+  };
+
+  const generatePatternPreview = () => {
+    const image = referenceElementRef.current;
+    if (!referenceImage || !image) {
+      notify("Upload and load an image first.", "warn");
+      return;
+    }
+
+    const sampleCanvas = createPatternSampleCanvas(image, referenceImage, project.canvas);
+    const ctx = sampleCanvas?.getContext("2d", { willReadFrequently: true });
+    if (!sampleCanvas || !ctx) {
+      notify("Could not sample that image.", "warn");
+      return;
+    }
+
+    patternWorkerRef.current?.terminate();
+    const worker = new Worker(new URL("../_workers/pattern.worker.ts", import.meta.url), {
+      type: "module",
+    });
+    patternWorkerRef.current = worker;
+    const settings = { ...patternSettings, strands: strandCount };
+    setPatternJob({
+      status: "working",
+      progress: { stage: "sampling", percent: 2 },
+    });
+    setReplaceConfirmed(false);
+    const imageData = ctx.getImageData(0, 0, sampleCanvas.width, sampleCanvas.height);
+
+    worker.onmessage = (
+      event: MessageEvent<
+        | { type: "progress"; progress: PatternProgress }
+        | { type: "result"; draft: PatternDraft }
+        | { type: "error"; message: string }
+      >,
+    ) => {
+      if (event.data.type === "progress") {
+        setPatternJob({ status: "working", progress: event.data.progress });
+        return;
+      }
+
+      worker.terminate();
+      if (patternWorkerRef.current === worker) patternWorkerRef.current = null;
+
+      if (event.data.type === "error") {
+        setPatternJob({ status: "error", message: event.data.message });
+        notify(event.data.message, "warn");
+        return;
+      }
+
+      const draft = {
+        ...event.data.draft,
+        cells:
+          event.data.draft.cells instanceof Uint16Array
+            ? event.data.draft.cells
+            : new Uint16Array(event.data.draft.cells),
+      };
+      setPatternDraft(draft);
+      setPatternJob({ status: "idle" });
+      setPreviewMode("both");
+      notify(
+        draft.stats.stitchedCells > 0
+          ? `${draft.stats.stitchedCells.toLocaleString()} stitches matched to ${draft.colors.length} thread colors.`
+          : "No stitchable image cells remain after background removal.",
+        draft.stats.stitchedCells > 0 ? "success" : "warn",
+      );
+    };
+
+    worker.onerror = () => {
+      worker.terminate();
+      if (patternWorkerRef.current === worker) patternWorkerRef.current = null;
+      setPatternJob({ status: "error", message: "Pattern conversion failed." });
+      notify("Pattern conversion failed.", "warn");
+    };
+
+    const rgba = imageData.data.buffer as ArrayBuffer;
+    worker.postMessage(
+      {
+        type: "convert",
+        rgba,
+        width: imageData.width,
+        height: imageData.height,
+        cols: project.canvas.cols - 1,
+        rows: project.canvas.rows - 1,
+        existingPalette: project.palette,
+        settings,
+      },
+      [rgba],
+    );
+  };
+
+  const commitPatternDraft = (mode: "replace" | "fill") => {
+    if (!patternDraft || patternDraft.stats.stitchedCells === 0) return;
+    const result = applyPatternDraft(project, patternDraft, mode);
+    commitProject(result.project);
+    setPatternDraft(null);
+    setReplaceConfirmed(false);
+    setPreviewMode("pattern");
+    notify(
+      `${result.additions.toLocaleString()} stitches applied, ${result.colorsAdded} DMC colors added${
+        result.occupiedSkipped || result.capacitySkipped
+          ? `; ${result.occupiedSkipped} occupied and ${result.capacitySkipped} capacity conflicts skipped`
+          : ""
+      }.`,
+      result.capacitySkipped ? "warn" : "success",
+    );
+  };
+
+  const replaceWithPattern = () => {
+    if (project.stitches.length > 0 && !replaceConfirmed) {
+      setReplaceConfirmed(true);
+      return;
+    }
+    commitPatternDraft("replace");
+  };
+
+  const cancelPdfExport = () => {
+    pdfWorkerRef.current?.terminate();
+    pdfWorkerRef.current = null;
+    setPdfJob({ status: "idle" });
+    notify("PDF export canceled.", "info");
+  };
+
+  const exportPatternPdf = async () => {
+    if (project.stitches.length === 0) {
+      notify("Add stitches before exporting a pattern.", "warn");
+      return;
+    }
+
+    setPdfJob({
+      status: "working",
+      progress: { stage: "preparing", percent: 2 },
+    });
+    const previewPng = await createPdfPreviewPng(project);
+    const worker = new Worker(new URL("../_workers/patternPdf.worker.ts", import.meta.url), {
+      type: "module",
+    });
+    pdfWorkerRef.current = worker;
+
+    worker.onmessage = (
+      event: MessageEvent<
+        | { type: "progress"; progress: PatternPdfProgress }
+        | { type: "result"; buffer: ArrayBuffer }
+        | { type: "error"; message: string }
+      >,
+    ) => {
+      if (event.data.type === "progress") {
+        setPdfJob({ status: "working", progress: event.data.progress });
+        return;
+      }
+      worker.terminate();
+      if (pdfWorkerRef.current === worker) pdfWorkerRef.current = null;
+      if (event.data.type === "error") {
+        setPdfJob({ status: "error", message: event.data.message });
+        notify(event.data.message, "warn");
+        return;
+      }
+      downloadBlob(
+        new Blob([event.data.buffer], { type: "application/pdf" }),
+        `needler-pattern-${formatTimestamp()}.pdf`,
+      );
+      setPdfJob({ status: "idle" });
+      notify("Printable pattern exported.", "success");
+    };
+
+    worker.onerror = () => {
+      worker.terminate();
+      if (pdfWorkerRef.current === worker) pdfWorkerRef.current = null;
+      setPdfJob({ status: "error", message: "PDF export failed." });
+      notify("PDF export failed.", "warn");
+    };
+
+    const payload = {
+      type: "generate" as const,
+      project,
+      paperSize,
+      previewPng: previewPng ?? undefined,
+    };
+    worker.postMessage(payload, previewPng ? [previewPng] : []);
+  };
+
+  const updatePatternSettings = (updates: Partial<PatternSettings>) => {
+    setPatternSettings((current) => ({ ...current, ...updates }));
+    setPatternDraft(null);
+    setReplaceConfirmed(false);
   };
 
   return (
@@ -1784,6 +2458,22 @@ export default function NeedlepointEditor() {
             onClick={() => setTool("pan")}
           >
             <Move size={18} strokeWidth={1.8} />
+          </IconButton>
+          <IconButton
+            label="Frame reference image"
+            active={tool === "image"}
+            disabled={!referenceImage}
+            onClick={() => setTool("image")}
+          >
+            <Crop size={18} strokeWidth={1.8} />
+          </IconButton>
+          <IconButton
+            label="Pick background color"
+            active={tool === "eyedropper"}
+            disabled={!referenceImage}
+            onClick={() => setTool("eyedropper")}
+          >
+            <Pipette size={18} strokeWidth={1.8} />
           </IconButton>
           <div className="hidden h-px w-9 bg-[#c7aa8e] lg:block" />
           <IconButton
@@ -1817,6 +2507,13 @@ export default function NeedlepointEditor() {
           <IconButton label="Export PNG" disabled={exporting} onClick={exportPng}>
             <Download size={18} strokeWidth={1.8} />
           </IconButton>
+          <IconButton
+            label="Export printable pattern PDF"
+            disabled={pdfJob.status === "working" || project.stitches.length === 0}
+            onClick={exportPatternPdf}
+          >
+            <FileText size={18} strokeWidth={1.8} />
+          </IconButton>
           <IconButton label="Reset sheet" onClick={resetProject}>
             <RotateCcw size={18} strokeWidth={1.8} />
           </IconButton>
@@ -1841,13 +2538,23 @@ export default function NeedlepointEditor() {
 
           <div
             ref={stageRef}
-            className="relative min-h-[560px] flex-1 overflow-hidden bg-[#d6bd9f] touch-none lg:min-h-0"
+            className={[
+              "relative min-h-[560px] flex-1 overflow-hidden bg-[#d6bd9f] touch-none lg:min-h-0",
+              tool === "image"
+                ? imageDrag
+                  ? "cursor-grabbing"
+                  : "cursor-grab"
+                : tool === "eyedropper"
+                  ? "cursor-crosshair"
+                  : "",
+            ].join(" ")}
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
             onPointerUp={handlePointerUp}
             onPointerCancel={() => {
               setDrag(null);
               setPanDrag(null);
+              setImageDrag(null);
             }}
             onWheel={handleWheel}
           >
@@ -1855,6 +2562,20 @@ export default function NeedlepointEditor() {
             <canvas ref={baseCanvasRef} className="absolute inset-0" />
             <canvas ref={stitchCanvasRef} className="absolute inset-0" />
             <canvas ref={previewCanvasRef} className="absolute inset-0" />
+            {patternJob.status === "working" ? (
+              <div className="pointer-events-none absolute left-1/2 top-4 w-[min(320px,calc(100%-32px))] -translate-x-1/2 rounded-md border border-[#d6bfa6] bg-[#fff8ef]/94 px-3 py-3 shadow-[0_14px_28px_-22px_rgba(58,35,22,0.5)]">
+                <div className="flex items-center justify-between gap-3 text-xs font-medium uppercase tracking-[0.08em] text-[#765943]">
+                  <span>{patternJob.progress.stage}</span>
+                  <span className="font-mono">{patternJob.progress.percent}%</span>
+                </div>
+                <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-[#e2d0bd]">
+                  <div
+                    className="h-full rounded-full bg-[#7e4e36] transition-transform duration-300 origin-left"
+                    style={{ transform: `scaleX(${patternJob.progress.percent / 100})` }}
+                  />
+                </div>
+              </div>
+            ) : null}
             {project.stitches.length === 0 ? (
               <div className="pointer-events-none absolute left-4 top-4 max-w-[230px] rounded-md border border-[#e2cbb2] bg-[#fff8ef]/88 px-3 py-2 text-sm text-[#765943] shadow-[0_12px_30px_-24px_rgba(58,35,22,0.42)]">
                 No stitches yet
@@ -1979,9 +2700,12 @@ export default function NeedlepointEditor() {
           </section>
 
           <section className="border-t border-[#e4d2bf] pt-4">
-            <h2 className="text-sm font-semibold uppercase tracking-[0.1em] text-[#765943]">
-              Reference image
-            </h2>
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="text-sm font-semibold uppercase tracking-[0.1em] text-[#765943]">
+                Image to pattern
+              </h2>
+              <span className="font-mono text-[10px] uppercase text-[#8a6c55]">Local</span>
+            </div>
             <div className="mt-3 grid gap-3">
               <label className={`${panelButtonClass()} cursor-pointer`}>
                 <ImagePlus size={16} strokeWidth={1.8} />
@@ -2005,8 +2729,69 @@ export default function NeedlepointEditor() {
                         : "Loading image"}
                     </p>
                   </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      className={panelButtonClass(tool === "image" ? "solid" : "quiet")}
+                      onClick={() => setTool("image")}
+                    >
+                      <Crop size={16} strokeWidth={1.8} />
+                      Drag image
+                    </button>
+                    <button
+                      type="button"
+                      className={panelButtonClass()}
+                      onClick={rotateReference}
+                    >
+                      <RotateCw size={16} strokeWidth={1.8} />
+                      Rotate 90
+                    </button>
+                    <button
+                      type="button"
+                      className={panelButtonClass(referenceImage.fit === "fit" ? "solid" : "quiet")}
+                      onClick={() => resetReferenceFrame("fit")}
+                    >
+                      Fit
+                    </button>
+                    <button
+                      type="button"
+                      className={panelButtonClass(referenceImage.fit === "fill" ? "solid" : "quiet")}
+                      onClick={() => resetReferenceFrame("fill")}
+                    >
+                      Fill
+                    </button>
+                  </div>
                   <label className="flex flex-col gap-2 text-sm font-medium text-[#4f392b]">
-                    Opacity
+                    Image scale
+                    <input
+                      type="range"
+                      min="0.25"
+                      max="4"
+                      step="0.01"
+                      value={referenceImage.transform.scale}
+                      className="accent-[#7e4e36]"
+                      onChange={(event) => {
+                        setReferenceImage((current) =>
+                          current
+                            ? {
+                                ...current,
+                                transform: {
+                                  ...current.transform,
+                                  scale: Number(event.target.value),
+                                },
+                              }
+                            : current,
+                        );
+                        setPatternDraft(null);
+                        setReplaceConfirmed(false);
+                      }}
+                    />
+                    <span className="font-mono text-xs font-normal text-[#8a6c55]">
+                      {Math.round(referenceImage.transform.scale * 100)}%
+                    </span>
+                  </label>
+                  <label className="flex flex-col gap-2 text-sm font-medium text-[#4f392b]">
+                    Overlay opacity
                     <input
                       type="range"
                       min="0.1"
@@ -2026,10 +2811,7 @@ export default function NeedlepointEditor() {
                       }
                     />
                   </label>
-                  <div className="grid grid-cols-[1fr_auto] items-center gap-2">
-                    <p className="font-mono text-xs text-[#765943]">
-                      {Math.round(referenceImage.opacity * 100)}% overlay
-                    </p>
+                  <div className="grid grid-cols-2 gap-2">
                     <button
                       type="button"
                       className={panelButtonClass()}
@@ -2038,11 +2820,269 @@ export default function NeedlepointEditor() {
                       <ImageOff size={16} strokeWidth={1.8} />
                       Clear
                     </button>
+                    <button
+                      type="button"
+                      className={panelButtonClass(tool === "eyedropper" ? "solid" : "quiet")}
+                      onClick={() => setTool("eyedropper")}
+                    >
+                      <Pipette size={16} strokeWidth={1.8} />
+                      Background
+                    </button>
                   </div>
+
+                  <div className="border-t border-[#e4d2bf] pt-3">
+                    <div className="grid grid-cols-3 overflow-hidden rounded-md border border-[#d8c4ad] bg-[#f2e6d8] p-1">
+                      {(["image", "both", "pattern"] as PreviewMode[]).map((mode) => (
+                        <button
+                          key={mode}
+                          type="button"
+                          disabled={
+                            !patternDraft &&
+                            project.stitches.length === 0 &&
+                            mode === "pattern"
+                          }
+                          className={[
+                            "h-8 rounded text-xs font-medium capitalize transition disabled:opacity-35",
+                            previewMode === mode
+                              ? "bg-white text-[#38271d] shadow-[0_2px_8px_-6px_rgba(58,35,22,0.5)]"
+                              : "text-[#765943]",
+                          ].join(" ")}
+                          onClick={() => setPreviewMode(mode)}
+                        >
+                          {mode}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <label className="flex flex-col gap-2 text-sm font-medium text-[#4f392b]">
+                    Maximum thread colors
+                    <input
+                      type="range"
+                      min="2"
+                      max="32"
+                      value={patternSettings.maxColors}
+                      className="accent-[#7e4e36]"
+                      onChange={(event) =>
+                        updatePatternSettings({ maxColors: Number(event.target.value) })
+                      }
+                    />
+                    <span className="font-mono text-xs font-normal text-[#8a6c55]">
+                      {patternSettings.maxColors} colors maximum
+                    </span>
+                  </label>
+
+                  <div>
+                    <p className="text-sm font-medium text-[#4f392b]">Detail cleanup</p>
+                    <div className="mt-2 grid grid-cols-3 gap-1 rounded-md border border-[#d8c4ad] bg-[#f2e6d8] p-1">
+                      {(["low", "medium", "high"] as PatternSettings["detail"][]).map(
+                        (detail) => (
+                          <button
+                            key={detail}
+                            type="button"
+                            className={[
+                              "h-8 rounded text-xs font-medium capitalize transition",
+                              patternSettings.detail === detail
+                                ? "bg-white text-[#38271d]"
+                                : "text-[#765943]",
+                            ].join(" ")}
+                            onClick={() => updatePatternSettings({ detail })}
+                          >
+                            {detail}
+                          </button>
+                        ),
+                      )}
+                    </div>
+                  </div>
+
+                  <div>
+                    <p className="text-sm font-medium text-[#4f392b]">Tent direction</p>
+                    <div className="mt-2 grid grid-cols-2 gap-1 rounded-md border border-[#d8c4ad] bg-[#f2e6d8] p-1">
+                      {(
+                        [
+                          ["slash", "/"],
+                          ["backslash", "\\"],
+                        ] as Array<[PatternDirection, string]>
+                      ).map(([direction, label]) => (
+                        <button
+                          key={direction}
+                          type="button"
+                          aria-label={`${direction} tent stitch`}
+                          className={[
+                            "h-8 rounded font-mono text-base transition",
+                            patternSettings.direction === direction
+                              ? "bg-white text-[#38271d]"
+                              : "text-[#765943]",
+                          ].join(" ")}
+                          onClick={() => updatePatternSettings({ direction })}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="rounded-md border border-[#e4d2bf] bg-white/70 px-3 py-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-xs font-medium uppercase tracking-[0.08em] text-[#765943]">
+                          Removed background
+                        </p>
+                        <p className="mt-1 font-mono text-xs text-[#8a6c55]">
+                          {patternSettings.backgroundHex ?? "None selected"}
+                        </p>
+                      </div>
+                      {patternSettings.backgroundHex ? (
+                        <button
+                          type="button"
+                          aria-label="Clear background color"
+                          title="Clear background color"
+                          className="flex h-8 w-8 items-center justify-center rounded-md border border-[#d8c4ad] bg-white text-[#765943]"
+                          onClick={() => updatePatternSettings({ backgroundHex: undefined })}
+                        >
+                          <X size={15} strokeWidth={1.8} />
+                        </button>
+                      ) : null}
+                    </div>
+                    {patternSettings.backgroundHex ? (
+                      <label className="mt-3 flex flex-col gap-2 text-xs font-medium text-[#4f392b]">
+                        Color tolerance
+                        <input
+                          type="range"
+                          min="0"
+                          max="30"
+                          value={patternSettings.backgroundTolerance}
+                          className="accent-[#7e4e36]"
+                          onChange={(event) =>
+                            updatePatternSettings({
+                              backgroundTolerance: Number(event.target.value),
+                            })
+                          }
+                        />
+                        <span className="font-mono font-normal text-[#8a6c55]">
+                          Delta E {patternSettings.backgroundTolerance}
+                        </span>
+                      </label>
+                    ) : null}
+                  </div>
+
+                  {patternJob.status === "working" ? (
+                    <div className="grid gap-2 rounded-md border border-[#d6bfa6] bg-[#f8efe3] px-3 py-3">
+                      <div className="flex items-center justify-between gap-3 text-xs font-medium uppercase tracking-[0.08em] text-[#765943]">
+                        <span>{patternJob.progress.stage}</span>
+                        <span className="font-mono">{patternJob.progress.percent}%</span>
+                      </div>
+                      <div className="h-1.5 overflow-hidden rounded-full bg-[#e2d0bd]">
+                        <div
+                          className="h-full origin-left rounded-full bg-[#7e4e36] transition-transform duration-300"
+                          style={{ transform: `scaleX(${patternJob.progress.percent / 100})` }}
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        className={panelButtonClass()}
+                        onClick={cancelPatternPreview}
+                      >
+                        <X size={16} strokeWidth={1.8} />
+                        Cancel
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      className={panelButtonClass("solid")}
+                      disabled={!referenceImage.width}
+                      onClick={generatePatternPreview}
+                    >
+                      <ScanLine size={16} strokeWidth={1.8} />
+                      Generate preview
+                    </button>
+                  )}
+
+                  {patternJob.status === "error" ? (
+                    <p className="rounded-md border border-[#cfa098] bg-[#fff3ef] px-3 py-2 text-xs text-[#8a332c]">
+                      {patternJob.message}
+                    </p>
+                  ) : null}
+
+                  {patternDraft ? (
+                    <div className="grid gap-3 border-t border-[#e4d2bf] pt-3">
+                      <div className="grid grid-cols-2 gap-2 font-mono text-xs text-[#765943]">
+                        <span>{patternDraft.stats.stitchedCells.toLocaleString()} stitches</span>
+                        <span>{patternDraft.colors.length} colors</span>
+                        <span>{newPatternColors.length} new DMC</span>
+                        <span>{patternDraft.stats.backgroundCells.toLocaleString()} omitted</span>
+                      </div>
+                      <div className="grid max-h-36 gap-1 overflow-y-auto pr-1">
+                        {patternDraft.colors.map((usage) => (
+                          <div
+                            key={usage.color.id}
+                            className="grid grid-cols-[20px_minmax(0,1fr)_auto] items-center gap-2 rounded border border-[#e4d2bf] bg-white/70 px-2 py-1.5"
+                          >
+                            <span
+                              className="h-5 w-5 rounded-sm border border-[#d0b69c]"
+                              style={{ backgroundColor: usage.color.hex }}
+                            />
+                            <span className="truncate text-xs text-[#4f392b]">
+                              {usage.color.floss ? `DMC ${usage.color.floss}` : usage.color.name}
+                            </span>
+                            <span className="font-mono text-[10px] text-[#8a6c55]">
+                              {usage.existing ? "Have" : "New"} {usage.count}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                      {project.stitches.length === 0 ? (
+                        <button
+                          type="button"
+                          className={panelButtonClass("solid")}
+                          onClick={() => commitPatternDraft("replace")}
+                        >
+                          <Check size={16} strokeWidth={1.8} />
+                          Apply pattern
+                        </button>
+                      ) : (
+                        <div className="grid gap-2">
+                          <div className="grid grid-cols-2 gap-2">
+                            <button
+                              type="button"
+                              className={panelButtonClass(replaceConfirmed ? "solid" : "quiet")}
+                              onClick={replaceWithPattern}
+                            >
+                              {replaceConfirmed ? (
+                                <Check size={16} strokeWidth={1.8} />
+                              ) : (
+                                <Layers3 size={16} strokeWidth={1.8} />
+                              )}
+                              {replaceConfirmed ? "Confirm" : "Replace"}
+                            </button>
+                            <button
+                              type="button"
+                              className={panelButtonClass("solid")}
+                              onClick={() => commitPatternDraft("fill")}
+                            >
+                              <Plus size={16} strokeWidth={1.8} />
+                              Fill empty
+                            </button>
+                          </div>
+                          {replaceConfirmed ? (
+                            <button
+                              type="button"
+                              className="text-xs font-medium text-[#8a332c] underline-offset-4 hover:underline"
+                              onClick={() => setReplaceConfirmed(false)}
+                            >
+                              Keep current stitches
+                            </button>
+                          ) : null}
+                        </div>
+                      )}
+                    </div>
+                  ) : null}
                 </>
               ) : (
                 <p className="text-xs leading-5 text-[#8a6c55]">
-                  Trace from a photo or sketch beneath the sheet grid.
+                  Upload a photo or sketch, frame it on the sheet, and match it to
+                  real DMC floss.
                 </p>
               )}
             </div>
@@ -2128,7 +3168,11 @@ export default function NeedlepointEditor() {
                   max="8"
                   value={strandCount}
                   className="accent-[#7e4e36]"
-                  onChange={(event) => setStrandCount(Number(event.target.value))}
+                  onChange={(event) => {
+                    setStrandCount(Number(event.target.value));
+                    setPatternDraft(null);
+                    setReplaceConfirmed(false);
+                  }}
                 />
               </label>
               <div className="font-mono text-xs text-[#765943]">
@@ -2178,6 +3222,23 @@ export default function NeedlepointEditor() {
             <h2 className="text-sm font-semibold uppercase tracking-[0.1em] text-[#765943]">
               Project
             </h2>
+            <div className="mt-3 grid grid-cols-2 gap-1 rounded-md border border-[#d8c4ad] bg-[#f2e6d8] p-1">
+              {(["letter", "a4"] as PatternPaperSize[]).map((size) => (
+                <button
+                  key={size}
+                  type="button"
+                  className={[
+                    "h-8 rounded text-xs font-medium uppercase transition",
+                    paperSize === size
+                      ? "bg-white text-[#38271d]"
+                      : "text-[#765943]",
+                  ].join(" ")}
+                  onClick={() => setPaperSize(size)}
+                >
+                  {size === "letter" ? "US Letter" : "A4"}
+                </button>
+              ))}
+            </div>
             <div className="mt-3 grid grid-cols-2 gap-2">
               <button
                 type="button"
@@ -2193,6 +3254,43 @@ export default function NeedlepointEditor() {
                 Reset
               </button>
             </div>
+            {pdfJob.status === "working" ? (
+              <div className="mt-2 grid gap-2 rounded-md border border-[#d6bfa6] bg-[#f8efe3] px-3 py-3">
+                <div className="flex items-center justify-between gap-3 text-xs font-medium uppercase tracking-[0.08em] text-[#765943]">
+                  <span>{pdfJob.progress.stage}</span>
+                  <span className="font-mono">{pdfJob.progress.percent}%</span>
+                </div>
+                <div className="h-1.5 overflow-hidden rounded-full bg-[#e2d0bd]">
+                  <div
+                    className="h-full origin-left rounded-full bg-[#7e4e36] transition-transform duration-300"
+                    style={{ transform: `scaleX(${pdfJob.progress.percent / 100})` }}
+                  />
+                </div>
+                <button
+                  type="button"
+                  className={panelButtonClass()}
+                  onClick={cancelPdfExport}
+                >
+                  <X size={16} strokeWidth={1.8} />
+                  Cancel PDF
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                className={`${panelButtonClass("solid")} mt-2 w-full`}
+                disabled={project.stitches.length === 0}
+                onClick={exportPatternPdf}
+              >
+                <FileText size={16} strokeWidth={1.8} />
+                Printable pattern PDF
+              </button>
+            )}
+            {pdfJob.status === "error" ? (
+              <p className="mt-2 rounded-md border border-[#cfa098] bg-[#fff3ef] px-3 py-2 text-xs text-[#8a332c]">
+                {pdfJob.message}
+              </p>
+            ) : null}
             <dl className="mt-4 grid grid-cols-2 gap-3 border-t border-[#e4d2bf] pt-4 text-sm">
               <div>
                 <dt className="text-xs uppercase tracking-[0.1em] text-[#8a6c55]">
