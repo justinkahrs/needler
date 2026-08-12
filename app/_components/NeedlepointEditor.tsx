@@ -13,7 +13,6 @@ import {
   Minus,
   Move,
   Palette,
-  PenLine,
   Pipette,
   Plus,
   Redo2,
@@ -1475,6 +1474,32 @@ function panelButtonClass(variant: "solid" | "quiet" = "quiet") {
   ].join(" ");
 }
 
+function NeedleIcon({
+  size = 18,
+  strokeWidth = 1.8,
+}: {
+  size?: number;
+  strokeWidth?: number;
+}) {
+  return (
+    <svg
+      aria-hidden="true"
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth={strokeWidth}
+    >
+      <path d="M19.8 4.2 3.8 20.2" />
+      <ellipse cx="18" cy="6" rx="2.7" ry="1.25" transform="rotate(-45 18 6)" />
+      <path d="M5.2 18.8 3.8 20.2" />
+    </svg>
+  );
+}
+
 function IconButton({
   label,
   active,
@@ -2776,7 +2801,7 @@ export default function NeedlepointEditor() {
             active={tool === "stitch"}
             onClick={() => setTool("stitch")}
           >
-            <PenLine size={18} strokeWidth={1.8} />
+            <NeedleIcon size={18} strokeWidth={1.8} />
           </IconButton>
           <IconButton
             label="Erase tool"
@@ -2926,9 +2951,15 @@ export default function NeedlepointEditor() {
                 ? imageDrag
                   ? "cursor-grabbing"
                   : "cursor-grab"
-                : tool === "eyedropper"
-                  ? "cursor-crosshair"
-                  : "",
+                : tool === "pan"
+                  ? panDrag
+                    ? "cursor-grabbing"
+                    : "cursor-grab"
+                  : tool === "eyedropper"
+                    ? "cursor-crosshair"
+                    : tool === "erase"
+                      ? "cursor-eraser"
+                      : "cursor-needle",
             ].join(" ")}
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
