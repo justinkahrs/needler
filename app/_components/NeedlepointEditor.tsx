@@ -19,11 +19,14 @@ import {
   Redo2,
   RotateCcw,
   RotateCw,
+  Save,
   ScanLine,
+  Share2,
   Undo2,
   X,
 } from "lucide-react";
 import ColorwayStudio from "@/app/_components/ColorwayStudio";
+import ShareProjectPanel from "@/app/_components/ShareProjectPanel";
 import { DMC_COLORS } from "@/app/_data/dmcColors";
 import type { DmcColor } from "@/app/_data/dmcColors";
 import {
@@ -42,6 +45,12 @@ import {
   makeEmptyColorState,
 } from "@/app/_lib/colorways";
 import type { PatternPdfProgress } from "@/app/_lib/patternPdf";
+import {
+  ShareProjectError,
+  decodeShareProject,
+  getShareTokenFromHash,
+} from "@/app/_lib/shareProject";
+import type { DecodedShareProject } from "@/app/_lib/shareProject";
 import {
   MAX_HOLE_STRAND_UNITS,
   canAddStitch,
@@ -84,7 +93,7 @@ type ReferenceImageState = {
   transform: ReferenceTransform;
 };
 type PreviewMode = "image" | "pattern" | "both";
-type RightPanelMode = "inspector" | "colorways";
+type RightPanelMode = "inspector" | "colorways" | "share";
 type DragState = { from: Hole; to: Hole | null } | null;
 type PanDragState =
   | {
@@ -1439,6 +1448,15 @@ function formatTimestamp() {
   return new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
 }
 
+function clearSharedProjectHash() {
+  if (!getShareTokenFromHash(window.location.hash)) return;
+  window.history.replaceState(
+    null,
+    "",
+    `${window.location.pathname}${window.location.search}`,
+  );
+}
+
 function toolButtonClass(active?: boolean) {
   return [
     "flex h-11 w-11 items-center justify-center rounded-md border text-sm transition active:translate-y-px disabled:cursor-not-allowed disabled:opacity-35",
@@ -1533,6 +1551,9 @@ export default function NeedlepointEditor() {
     string,
     string
   > | null>(null);
+  const [sharedProjectSource, setSharedProjectSource] = useState<
+    "url" | "file" | null
+  >(null);
 
   const stageRef = useRef<HTMLDivElement | null>(null);
   const baseCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -1542,6 +1563,9 @@ export default function NeedlepointEditor() {
   const patternWorkerRef = useRef<Worker | null>(null);
   const pdfWorkerRef = useRef<Worker | null>(null);
   const hasFitViewRef = useRef(false);
+  const localWorkspaceRef = useRef<{ project: Project; rotation: number } | null>(
+    null,
+  );
 
   const meshCount = getMeshCount(project.canvas);
   const physicalWidth = project.canvas.widthIn;
@@ -1624,6 +1648,16 @@ export default function NeedlepointEditor() {
     setRightPanelMode("inspector");
   };
 
+  const openSharePanel = () => {
+    if (patternDraft) {
+      notify("Apply or clear the image preview before sharing.", "warn");
+      return;
+    }
+    setColorwayPreview(null);
+    setInitialColorwayRoleId(undefined);
+    setRightPanelMode("share");
+  };
+
   const commitColorwayProject = (nextProject: Project, message: string) => {
     commitProject(nextProject);
     const nextUsed = getUsedResolvedColors(nextProject);
@@ -1682,32 +1716,70 @@ export default function NeedlepointEditor() {
   }, []);
 
   useEffect(() => {
-    let loadedProject: Project | null = null;
+    let active = true;
 
-    try {
-      for (const key of [
-        PROJECT_STORAGE_KEY,
-        PREVIOUS_PROJECT_STORAGE_KEY,
-        LEGACY_PROJECT_STORAGE_KEY,
-      ]) {
-        const savedProject = window.localStorage.getItem(key);
-        if (!savedProject) continue;
-        loadedProject = deserializeProject(JSON.parse(savedProject) as unknown);
-        if (loadedProject) break;
+    const hydrateEditor = async () => {
+      let loadedProject: Project | null = null;
+
+      try {
+        for (const key of [
+          PROJECT_STORAGE_KEY,
+          PREVIOUS_PROJECT_STORAGE_KEY,
+          LEGACY_PROJECT_STORAGE_KEY,
+        ]) {
+          const savedProject = window.localStorage.getItem(key);
+          if (!savedProject) continue;
+          loadedProject = deserializeProject(JSON.parse(savedProject) as unknown);
+          if (loadedProject) break;
+        }
+      } catch {
+        loadedProject = null;
       }
-    } catch {
-      loadedProject = null;
-    }
 
-    const nextProject = loadedProject
-      ? normalizeProject(loadedProject)
-      : makeDefaultProject();
+      const localProject = loadedProject
+        ? normalizeProject(loadedProject)
+        : makeDefaultProject();
+      localWorkspaceRef.current = { project: localProject, rotation: 0 };
 
-    dispatch({ type: "hydrate", project: nextProject });
-  }, []);
+      const token = getShareTokenFromHash(window.location.hash);
+      if (token) {
+        try {
+          const shared = await decodeShareProject(token);
+          if (!active) return;
+          const sharedProject = normalizeProject(shared.project);
+          dispatch({ type: "hydrate", project: sharedProject });
+          setSharedProjectSource("url");
+          setView((current) => ({
+            ...current,
+            rotation: shared.rotation,
+          }));
+          hasFitViewRef.current = false;
+          const firstUsedColor = getUsedResolvedColors(sharedProject)[0]?.color.id;
+          if (firstUsedColor) setSelectedColorId(firstUsedColor);
+          notify("Shared project opened as a temporary copy.", "success");
+          return;
+        } catch (error) {
+          if (!active) return;
+          notify(
+            error instanceof ShareProjectError
+              ? error.message
+              : "Could not open this shared project.",
+            "warn",
+          );
+        }
+      }
+
+      if (active) dispatch({ type: "hydrate", project: localProject });
+    };
+
+    void hydrateEditor();
+    return () => {
+      active = false;
+    };
+  }, [notify]);
 
   useEffect(() => {
-    if (!state.hydrated) {
+    if (!state.hydrated || sharedProjectSource) {
       return;
     }
 
@@ -1720,7 +1792,12 @@ export default function NeedlepointEditor() {
     }, 120);
 
     return () => window.clearTimeout(timeout);
-  }, [notify, project, state.hydrated]);
+  }, [notify, project, sharedProjectSource, state.hydrated]);
+
+  useEffect(() => {
+    if (!state.hydrated || sharedProjectSource) return;
+    localWorkspaceRef.current = { project, rotation: view.rotation };
+  }, [project, sharedProjectSource, state.hydrated, view.rotation]);
 
   useEffect(() => {
     if (!notice) {
@@ -2262,6 +2339,103 @@ export default function NeedlepointEditor() {
     notify("Sheet reset. Undo is available.", "info");
   };
 
+  const openTemporaryProject = useCallback(
+    (shared: DecodedShareProject, source: "url" | "file") => {
+      if (!sharedProjectSource) {
+        localWorkspaceRef.current = { project, rotation: view.rotation };
+      }
+      const nextProject = normalizeProject(shared.project);
+      patternWorkerRef.current?.terminate();
+      patternWorkerRef.current = null;
+      referenceElementRef.current = null;
+      setReferenceImage(null);
+      setPatternDraft(null);
+      setPatternJob({ status: "idle" });
+      setReplaceConfirmed(false);
+      setColorwayPreview(null);
+      setInitialColorwayRoleId(undefined);
+      setRightPanelMode("inspector");
+      dispatch({ type: "hydrate", project: nextProject });
+      setSharedProjectSource(source);
+      setView((current) => ({ ...current, rotation: shared.rotation }));
+      hasFitViewRef.current = false;
+      const firstUsedColor = getUsedResolvedColors(nextProject)[0]?.color.id;
+      if (firstUsedColor) setSelectedColorId(firstUsedColor);
+    },
+    [project, sharedProjectSource, view.rotation],
+  );
+
+  const saveSharedProjectLocally = () => {
+    try {
+      window.localStorage.setItem(PROJECT_STORAGE_KEY, serializeProject(project));
+      localWorkspaceRef.current = { project, rotation: view.rotation };
+      setSharedProjectSource(null);
+      clearSharedProjectHash();
+      notify("Shared project saved locally.", "success");
+    } catch {
+      notify("Local storage is not available.", "warn");
+    }
+  };
+
+  const returnToLocalProject = useCallback(() => {
+    const local = localWorkspaceRef.current ?? {
+      project: makeDefaultProject(),
+      rotation: 0,
+    };
+    dispatch({ type: "hydrate", project: local.project });
+    setSharedProjectSource(null);
+    setPatternDraft(null);
+    setReplaceConfirmed(false);
+    setColorwayPreview(null);
+    setInitialColorwayRoleId(undefined);
+    setRightPanelMode("inspector");
+    setView((current) => ({ ...current, rotation: local.rotation }));
+    hasFitViewRef.current = false;
+    clearSharedProjectHash();
+    const firstUsedColor = getUsedResolvedColors(local.project)[0]?.color.id;
+    if (firstUsedColor) setSelectedColorId(firstUsedColor);
+    notify("Returned to the locally saved project.", "info");
+  }, [notify]);
+
+  useEffect(() => {
+    if (!state.hydrated) return;
+
+    let active = true;
+    const handleHashChange = async () => {
+      const token = getShareTokenFromHash(window.location.hash);
+      if (!token) {
+        if (sharedProjectSource === "url") returnToLocalProject();
+        return;
+      }
+      try {
+        const shared = await decodeShareProject(token);
+        if (!active) return;
+        openTemporaryProject(shared, "url");
+        notify("Shared project opened as a temporary copy.", "success");
+      } catch (error) {
+        if (!active) return;
+        notify(
+          error instanceof ShareProjectError
+            ? error.message
+            : "Could not open this shared project.",
+          "warn",
+        );
+      }
+    };
+
+    window.addEventListener("hashchange", handleHashChange);
+    return () => {
+      active = false;
+      window.removeEventListener("hashchange", handleHashChange);
+    };
+  }, [
+    notify,
+    openTemporaryProject,
+    returnToLocalProject,
+    sharedProjectSource,
+    state.hydrated,
+  ]);
+
   const exportPng = () => {
     setExporting(true);
 
@@ -2669,6 +2843,13 @@ export default function NeedlepointEditor() {
             <RotateCw size={18} strokeWidth={1.8} />
           </IconButton>
           <div className="hidden h-px w-9 bg-[#c7aa8e] lg:block" />
+          <IconButton
+            label="Share project"
+            active={rightPanelMode === "share"}
+            onClick={openSharePanel}
+          >
+            <Share2 size={18} strokeWidth={1.8} />
+          </IconButton>
           <IconButton label="Export PNG" disabled={exporting} onClick={exportPng}>
             <Download size={18} strokeWidth={1.8} />
           </IconButton>
@@ -2697,9 +2878,45 @@ export default function NeedlepointEditor() {
             </div>
             <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-[0.08em] text-[#765943]">
               <span className="h-2 w-2 rounded-full bg-[#6f8d62]" />
-              {state.hydrated ? "Saved locally" : "Loading"}
+              {state.hydrated
+                ? sharedProjectSource
+                  ? "Temporary copy"
+                  : "Saved locally"
+                : "Loading"}
             </div>
           </div>
+
+          {sharedProjectSource ? (
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#dec9b1] bg-[#f4e4d1] px-4 py-2.5">
+              <div className="flex min-w-0 items-center gap-2 text-sm font-medium text-[#4f392b]">
+                <Share2 size={15} strokeWidth={1.8} className="shrink-0" />
+                <span className="truncate">
+                  {sharedProjectSource === "url" ? "Shared link" : "Opened file"}
+                </span>
+                <span className="rounded bg-[#e1c9af] px-1.5 py-0.5 font-mono text-[9px] uppercase text-[#765943]">
+                  Temporary
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  className="inline-flex h-8 items-center gap-1.5 rounded-md border border-[#7e4e36] bg-[#7e4e36] px-2.5 text-xs font-medium text-white hover:bg-[#6f422d]"
+                  onClick={saveSharedProjectLocally}
+                >
+                  <Save size={14} strokeWidth={1.8} />
+                  Save locally
+                </button>
+                <button
+                  type="button"
+                  className="inline-flex h-8 items-center gap-1.5 rounded-md border border-[#c9ad91] bg-[#fff8ef] px-2.5 text-xs font-medium text-[#5e4432] hover:bg-white"
+                  onClick={returnToLocalProject}
+                >
+                  <RotateCcw size={14} strokeWidth={1.8} />
+                  Return
+                </button>
+              </div>
+            </div>
+          ) : null}
 
           <div
             ref={stageRef}
@@ -2774,6 +2991,14 @@ export default function NeedlepointEditor() {
             onPreview={handleColorwayPreview}
             onCommit={commitColorwayProject}
             onClose={closeColorwayStudio}
+          />
+        ) : rightPanelMode === "share" ? (
+          <ShareProjectPanel
+            project={project}
+            rotation={view.rotation}
+            onOpenProject={openTemporaryProject}
+            onNotify={notify}
+            onClose={() => setRightPanelMode("inspector")}
           />
         ) : (
         <aside className="order-3 flex flex-col gap-4 rounded-lg border border-[#d6bfa6] bg-[#fff8ef] p-4 shadow-[0_20px_44px_-30px_rgba(87,55,35,0.32)] lg:max-h-[calc(100dvh-2rem)] lg:overflow-auto">
@@ -3488,6 +3713,14 @@ export default function NeedlepointEditor() {
                 Reset
               </button>
             </div>
+            <button
+              type="button"
+              className={`${panelButtonClass()} mt-2 w-full`}
+              onClick={openSharePanel}
+            >
+              <Share2 size={16} strokeWidth={1.8} />
+              Share project
+            </button>
             {pdfJob.status === "working" ? (
               <div className="mt-2 grid gap-2 rounded-md border border-[#d6bfa6] bg-[#f8efe3] px-3 py-3">
                 <div className="flex items-center justify-between gap-3 text-xs font-medium uppercase tracking-[0.08em] text-[#765943]">

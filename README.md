@@ -9,6 +9,10 @@ switch complete thread schemes without altering the stitch plan.
 The editor enforces an 18-strand capacity at every hole, stores projects in
 local browser storage, exports stitched PNG previews, and produces printable
 Letter or A4 pattern PDFs with a DMC key and twelve 42 x 42-cell chart pages.
+Finished projects can also be shared without a backend through compressed URL
+fragments. Dense tent-stitch designs use a packed cell grid, while manual and
+layered work retains ordered stitch data. Oversized projects can be exchanged
+as `.needler` files; reference images are intentionally excluded from both.
 
 ## Getting Started
 
