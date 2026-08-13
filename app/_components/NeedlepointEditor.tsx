@@ -1957,6 +1957,10 @@ function IconButton({
   );
 }
 
+function stopStageOverlayEvent(event: { stopPropagation: () => void }) {
+  event.stopPropagation();
+}
+
 export default function NeedlepointEditor() {
   const [state, dispatch] = useReducer(editorReducer, undefined, () => ({
     project: makeDefaultProject(),
@@ -1979,6 +1983,7 @@ export default function NeedlepointEditor() {
   const [exporting, setExporting] = useState(false);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [quickColorCollapsed, setQuickColorCollapsed] = useState(false);
+  const [imageToolbarCollapsed, setImageToolbarCollapsed] = useState(false);
   const [dmcQuery, setDmcQuery] = useState("");
   const [customHex, setCustomHex] = useState("#c72b3b");
   const [customName, setCustomName] = useState("Custom thread");
@@ -3724,154 +3729,375 @@ export default function NeedlepointEditor() {
 
   const activeToolLabel = getToolLabel(tool);
   const activePanelLabel = getPanelLabel(rightPanelMode);
+  const imageToolbarTop = quickColorCollapsed
+    ? "max(4.9rem, calc(env(safe-area-inset-top) + 4.9rem))"
+    : "max(15.75rem, calc(env(safe-area-inset-top) + 15.75rem))";
+  const compactImageToolbar =
+    imageToolbarCollapsed || (!referenceImage && referenceImages.length === 0);
   const workspaceGridClass = [
-    "mx-auto grid min-h-[100dvh] w-full max-w-[1800px] grid-cols-1 gap-3 px-2 py-2 md:px-3 md:py-3 xl:px-4 xl:py-4",
-    toolRailCollapsed && panelCollapsed
-      ? "xl:grid-cols-[48px_minmax(0,1fr)_48px]"
-      : toolRailCollapsed
-        ? "xl:grid-cols-[48px_minmax(0,1fr)_330px]"
-        : panelCollapsed
-          ? "xl:grid-cols-[72px_minmax(0,1fr)_48px]"
-          : "xl:grid-cols-[72px_minmax(0,1fr)_330px]",
-  ].join(" ");
-  const toolRailClass = [
-    "order-2 flex items-center gap-2 overflow-x-auto rounded-lg border border-[#d6bfa6] bg-[#ead9c4]/78 p-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.52)] xl:order-1 xl:flex-col xl:overflow-visible",
-    toolRailCollapsed ? "justify-between xl:w-12 xl:px-1" : "",
+    "relative mx-auto grid h-full max-h-full min-h-0 w-full max-w-[1800px] grid-cols-1 overflow-hidden p-2 md:p-3 xl:gap-3 xl:p-4",
+    panelCollapsed
+      ? "xl:grid-cols-[minmax(0,1fr)_48px]"
+      : "xl:grid-cols-[minmax(0,1fr)_330px]",
   ].join(" ");
   const stagePanelClass =
-    "order-1 flex min-h-[clamp(600px,78dvh,960px)] min-w-0 flex-col rounded-lg border border-[#cfb69c] bg-[#f8f0e5] shadow-[0_20px_44px_-28px_rgba(87,55,35,0.36)] md:min-h-[clamp(680px,80dvh,1040px)] xl:order-2 xl:min-h-[calc(100dvh-2rem)]";
-
-  return (
-    <main className="min-h-[100dvh] bg-[#f3ebdf] text-[#38271d]">
-      <div className={workspaceGridClass}>
-        <aside className={toolRailClass}>
-          <IconButton
-            label={toolRailCollapsed ? "Show tools" : "Collapse tools"}
-            onClick={() => setToolRailCollapsed((current) => !current)}
-          >
-            {toolRailCollapsed ? (
-              <PanelLeftOpen size={18} strokeWidth={1.8} />
-            ) : (
-              <PanelLeftClose size={18} strokeWidth={1.8} />
-            )}
-          </IconButton>
+    "order-1 flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border border-[#cfb69c] bg-[#f8f0e5] shadow-[0_20px_44px_-28px_rgba(87,55,35,0.36)]";
+  const sidePanelShellClass = [
+    "absolute inset-x-2 bottom-2 z-20 min-h-0 overflow-hidden md:inset-x-auto md:bottom-3 md:right-3 md:top-3 md:w-[330px] xl:static xl:order-2 xl:z-auto xl:w-auto",
+    panelCollapsed ? "h-16 md:h-auto" : "h-[min(58dvh,620px)] md:h-auto",
+  ].join(" ");
+  const primaryCanvasToolbar = (
+    <div
+      role="toolbar"
+      aria-label="Canvas tools"
+      className="pointer-events-auto absolute z-10 max-h-[calc(100dvh-3.5rem)] overflow-y-auto rounded-md border border-[#d6bfa6] bg-[#fff8ef]/94 p-1.5 shadow-[0_18px_36px_-26px_rgba(58,35,22,0.55)]"
+      style={{
+        left: "max(0.75rem, env(safe-area-inset-left))",
+        top: "max(0.75rem, env(safe-area-inset-top))",
+      }}
+      onPointerDown={stopStageOverlayEvent}
+      onPointerMove={stopStageOverlayEvent}
+      onPointerUp={stopStageOverlayEvent}
+      onPointerCancel={stopStageOverlayEvent}
+      onWheel={stopStageOverlayEvent}
+    >
+      <div className="grid gap-1">
+        <IconButton
+          label={toolRailCollapsed ? "Show tools" : "Collapse tools"}
+          onClick={() => setToolRailCollapsed((current) => !current)}
+        >
           {toolRailCollapsed ? (
+            <PanelLeftOpen size={18} strokeWidth={1.8} />
+          ) : (
+            <PanelLeftClose size={18} strokeWidth={1.8} />
+          )}
+        </IconButton>
+        {toolRailCollapsed ? (
+          <button
+            type="button"
+            aria-label={`Active tool: ${activeToolLabel}`}
+            title={`Active tool: ${activeToolLabel}`}
+            className="flex h-11 w-11 items-center justify-center rounded-md border border-[#7e4e36] bg-[#7e4e36] text-[#fff9f0] shadow-[inset_0_1px_0_rgba(255,255,255,0.18)]"
+            onClick={() => setToolRailCollapsed(false)}
+          >
+            <ToolGlyph tool={tool} size={18} strokeWidth={1.8} />
+          </button>
+        ) : (
+          <>
+            <IconButton
+              label="Stitch tool"
+              active={tool === "stitch"}
+              onClick={() => setTool("stitch")}
+            >
+              <NeedleIcon size={18} strokeWidth={1.8} />
+            </IconButton>
+            <IconButton
+              label="Erase tool"
+              active={tool === "erase"}
+              onClick={() => setTool("erase")}
+            >
+              <Eraser size={18} strokeWidth={1.8} />
+            </IconButton>
+            <IconButton
+              label="Pan tool"
+              active={tool === "pan"}
+              onClick={() => setTool("pan")}
+            >
+              <Move size={18} strokeWidth={1.8} />
+            </IconButton>
+            <div className="mx-auto h-px w-8 bg-[#dcc7ae]" />
+            <IconButton
+              label="Frame reference image"
+              active={tool === "image"}
+              disabled={!referenceImage}
+              onClick={() => setTool("image")}
+            >
+              <Crop size={18} strokeWidth={1.8} />
+            </IconButton>
+            <IconButton
+              label="Pick background color"
+              active={tool === "eyedropper"}
+              disabled={!referenceImage}
+              onClick={() => setTool("eyedropper")}
+            >
+              <Pipette size={18} strokeWidth={1.8} />
+            </IconButton>
+            <div className="mx-auto h-px w-8 bg-[#dcc7ae]" />
+            <IconButton
+              label="Undo"
+              disabled={state.past.length === 0}
+              onClick={() => {
+                closeColorwayStudio();
+                dispatch({ type: "undo" });
+              }}
+            >
+              <Undo2 size={18} strokeWidth={1.8} />
+            </IconButton>
+            <IconButton
+              label="Redo"
+              disabled={state.future.length === 0}
+              onClick={() => {
+                closeColorwayStudio();
+                dispatch({ type: "redo" });
+              }}
+            >
+              <Redo2 size={18} strokeWidth={1.8} />
+            </IconButton>
+            <div className="mx-auto h-px w-8 bg-[#dcc7ae]" />
+            <IconButton label="Zoom in" onClick={() => zoomAroundCenter(1.12)}>
+              <Plus size={18} strokeWidth={1.8} />
+            </IconButton>
+            <IconButton label="Zoom out" onClick={() => zoomAroundCenter(0.88)}>
+              <Minus size={18} strokeWidth={1.8} />
+            </IconButton>
+            <IconButton label="Fit sheet" onClick={fitView}>
+              <Maximize2 size={18} strokeWidth={1.8} />
+            </IconButton>
+            <IconButton
+              label="Rotate sheet 90 degrees"
+              onClick={() => rotateViewBy(90)}
+            >
+              <RotateCw size={18} strokeWidth={1.8} />
+            </IconButton>
+            <div className="mx-auto h-px w-8 bg-[#dcc7ae]" />
+            <IconButton
+              label="Share project"
+              active={rightPanelMode === "share"}
+              onClick={openSharePanel}
+            >
+              <Share2 size={18} strokeWidth={1.8} />
+            </IconButton>
+            <IconButton label="Export PNG" disabled={exporting} onClick={exportPng}>
+              {exporting ? (
+                <LoaderCircle size={18} strokeWidth={1.8} className="animate-spin" />
+              ) : (
+                <Download size={18} strokeWidth={1.8} />
+              )}
+            </IconButton>
+            <IconButton
+              label="Export printable pattern PDF"
+              disabled={isPdfExporting || project.stitches.length === 0}
+              onClick={exportPatternPdf}
+            >
+              {isPdfExporting ? (
+                <LoaderCircle size={18} strokeWidth={1.8} className="animate-spin" />
+              ) : (
+                <FileText size={18} strokeWidth={1.8} />
+              )}
+            </IconButton>
+            <IconButton label="Reset sheet" onClick={() => setShowResetConfirm(true)}>
+              <Trash2 size={18} strokeWidth={1.8} />
+            </IconButton>
+          </>
+        )}
+      </div>
+    </div>
+  );
+  const imageCanvasToolbar = (
+    <div
+      role="toolbar"
+      aria-label="Reference image tools"
+      className={[
+        "pointer-events-auto absolute z-10",
+        compactImageToolbar ? "w-11" : "w-[min(250px,calc(100%-5rem))]",
+      ].join(" ")}
+      style={{
+        right: "max(0.75rem, env(safe-area-inset-right))",
+        top: imageToolbarTop,
+      }}
+      onPointerDown={stopStageOverlayEvent}
+      onPointerMove={stopStageOverlayEvent}
+      onPointerUp={stopStageOverlayEvent}
+      onPointerCancel={stopStageOverlayEvent}
+      onWheel={stopStageOverlayEvent}
+    >
+      {!referenceImage && referenceImages.length === 0 ? (
+        <label
+          aria-label="Add reference images"
+          title="Add reference images"
+          className={`${toolButtonClass()} cursor-pointer bg-[#fff8ef]/94 shadow-[0_12px_30px_-24px_rgba(58,35,22,0.5)]`}
+        >
+          <ImagePlus size={18} strokeWidth={1.8} />
+          <input
+            type="file"
+            accept="image/*"
+            multiple
+            className="sr-only"
+            onChange={handleReferenceUpload}
+          />
+        </label>
+      ) : imageToolbarCollapsed ? (
+        <button
+          type="button"
+          aria-label="Show image tools"
+          title="Show image tools"
+          className="flex h-11 w-11 items-center justify-center rounded-md border border-[#d8c4ad] bg-[#fff8ef]/94 text-[#4f392b] shadow-[0_12px_30px_-24px_rgba(58,35,22,0.5)] transition active:translate-y-px"
+          onClick={() => setImageToolbarCollapsed(false)}
+        >
+          <Crop size={18} strokeWidth={1.8} />
+        </button>
+      ) : (
+        <div className="rounded-md border border-[#d6bfa6] bg-[#fff8ef]/94 p-2 shadow-[0_18px_36px_-26px_rgba(58,35,22,0.55)]">
+          <div className="grid grid-cols-[36px_minmax(0,1fr)_32px] items-center gap-1.5">
+            <label
+              aria-label="Add reference images"
+              title="Add reference images"
+              className={`${toolButtonClass()} h-9 w-9 cursor-pointer`}
+            >
+              <ImagePlus size={16} strokeWidth={1.8} />
+              <input
+                type="file"
+                accept="image/*"
+                multiple
+                className="sr-only"
+                onChange={handleReferenceUpload}
+              />
+            </label>
+            {referenceImages.length > 1 ? (
+              <select
+                aria-label="Active reference image"
+                value={resolvedActiveReferenceImageId ?? ""}
+                className="h-9 min-w-0 rounded-md border border-[#d8c4ad] bg-white px-2 text-xs font-medium text-[#4f392b] outline-none transition focus:border-[#7e4e36]"
+                onChange={(event) => selectReferenceImage(event.target.value)}
+              >
+                {referenceImages.map((imageState) => (
+                  <option key={imageState.id} value={imageState.id}>
+                    {imageState.name}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <button
+                type="button"
+                className="h-9 min-w-0 truncate rounded-md border border-[#d8c4ad] bg-white px-2 text-left text-xs font-medium text-[#4f392b]"
+                onClick={() => {
+                  setPanelCollapsed(false);
+                  setRightPanelMode("inspector");
+                }}
+              >
+                {referenceImage?.name ?? "Image"}
+              </button>
+            )}
             <button
               type="button"
-              aria-label={`Active tool: ${activeToolLabel}`}
-              title={`Active tool: ${activeToolLabel}`}
-              className="flex h-11 min-w-11 items-center justify-center gap-2 rounded-md border border-[#7e4e36] bg-[#7e4e36] px-2 text-sm font-medium text-[#fff9f0] shadow-[inset_0_1px_0_rgba(255,255,255,0.18)]"
-              onClick={() => setToolRailCollapsed(false)}
+              aria-label="Collapse image tools"
+              title="Collapse image tools"
+              className="flex h-9 w-8 items-center justify-center rounded-md border border-[#d8c4ad] bg-white text-[#654a38] transition active:translate-y-px"
+              onClick={() => setImageToolbarCollapsed(true)}
             >
-              <ToolGlyph tool={tool} size={18} strokeWidth={1.8} />
-              <span className="md:inline xl:hidden">{activeToolLabel}</span>
+              <PanelRightClose size={15} strokeWidth={1.8} />
             </button>
-          ) : (
-            <>
-          <IconButton
-            label="Stitch tool"
-            active={tool === "stitch"}
-            onClick={() => setTool("stitch")}
-          >
-            <NeedleIcon size={18} strokeWidth={1.8} />
-          </IconButton>
-          <IconButton
-            label="Erase tool"
-            active={tool === "erase"}
-            onClick={() => setTool("erase")}
-          >
-            <Eraser size={18} strokeWidth={1.8} />
-          </IconButton>
-          <IconButton
-            label="Pan tool"
-            active={tool === "pan"}
-            onClick={() => setTool("pan")}
-          >
-            <Move size={18} strokeWidth={1.8} />
-          </IconButton>
-          <IconButton
-            label="Frame reference image"
-            active={tool === "image"}
-            disabled={!referenceImage}
-            onClick={() => setTool("image")}
-          >
-            <Crop size={18} strokeWidth={1.8} />
-          </IconButton>
-          <IconButton
-            label="Pick background color"
-            active={tool === "eyedropper"}
-            disabled={!referenceImage}
-            onClick={() => setTool("eyedropper")}
-          >
-            <Pipette size={18} strokeWidth={1.8} />
-          </IconButton>
-          <div className="hidden h-px w-9 bg-[#c7aa8e] lg:block" />
-          <IconButton
-            label="Undo"
-            disabled={state.past.length === 0}
-            onClick={() => {
-              closeColorwayStudio();
-              dispatch({ type: "undo" });
-            }}
-          >
-            <Undo2 size={18} strokeWidth={1.8} />
-          </IconButton>
-          <IconButton
-            label="Redo"
-            disabled={state.future.length === 0}
-            onClick={() => {
-              closeColorwayStudio();
-              dispatch({ type: "redo" });
-            }}
-          >
-            <Redo2 size={18} strokeWidth={1.8} />
-          </IconButton>
-          <div className="hidden h-px w-9 bg-[#c7aa8e] lg:block" />
-          <IconButton label="Zoom in" onClick={() => zoomAroundCenter(1.12)}>
-            <Plus size={18} strokeWidth={1.8} />
-          </IconButton>
-          <IconButton label="Zoom out" onClick={() => zoomAroundCenter(0.88)}>
-            <Minus size={18} strokeWidth={1.8} />
-          </IconButton>
-          <IconButton label="Fit sheet" onClick={fitView}>
-            <Maximize2 size={18} strokeWidth={1.8} />
-          </IconButton>
-          <IconButton label="Rotate sheet 90 degrees" onClick={() => rotateViewBy(90)}>
-            <RotateCw size={18} strokeWidth={1.8} />
-          </IconButton>
-          <div className="hidden h-px w-9 bg-[#c7aa8e] lg:block" />
-          <IconButton
-            label="Share project"
-            active={rightPanelMode === "share"}
-            onClick={openSharePanel}
-          >
-            <Share2 size={18} strokeWidth={1.8} />
-          </IconButton>
-          <IconButton label="Export PNG" disabled={exporting} onClick={exportPng}>
-            {exporting ? (
-              <LoaderCircle size={18} strokeWidth={1.8} className="animate-spin" />
-            ) : (
-              <Download size={18} strokeWidth={1.8} />
-            )}
-          </IconButton>
-          <IconButton
-            label="Export printable pattern PDF"
-            disabled={isPdfExporting || project.stitches.length === 0}
-            onClick={exportPatternPdf}
-          >
-            {isPdfExporting ? (
-              <LoaderCircle size={18} strokeWidth={1.8} className="animate-spin" />
-            ) : (
-              <FileText size={18} strokeWidth={1.8} />
-            )}
-          </IconButton>
-          <IconButton label="Reset sheet" onClick={() => setShowResetConfirm(true)}>
-            <Trash2 size={18} strokeWidth={1.8} />
-          </IconButton>
-            </>
-          )}
-        </aside>
+          </div>
 
+          {referenceImage ? (
+            <>
+              <div className="mt-2 grid grid-cols-4 gap-1">
+                <IconButton
+                  label="Frame reference image"
+                  active={tool === "image"}
+                  onClick={() => setTool("image")}
+                >
+                  <Crop size={16} strokeWidth={1.8} />
+                </IconButton>
+                <IconButton
+                  label="Pick background color"
+                  active={tool === "eyedropper"}
+                  onClick={() => setTool("eyedropper")}
+                >
+                  <Pipette size={16} strokeWidth={1.8} />
+                </IconButton>
+                <IconButton label="Rotate reference image" onClick={rotateReference}>
+                  <RotateCw size={16} strokeWidth={1.8} />
+                </IconButton>
+                <IconButton label="Remove reference image" onClick={clearReferenceImage}>
+                  <ImageOff size={16} strokeWidth={1.8} />
+                </IconButton>
+              </div>
+              <div className="mt-2 grid grid-cols-2 gap-1">
+                <button
+                  type="button"
+                  className={[
+                    "h-8 rounded-md border text-xs font-medium transition active:translate-y-px",
+                    referenceImage.fit === "fit"
+                      ? "border-[#7e4e36] bg-[#7e4e36] text-[#fff9f0]"
+                      : "border-[#d8c4ad] bg-white text-[#4f392b]",
+                  ].join(" ")}
+                  onClick={() => resetReferenceFrame("fit")}
+                >
+                  Fit
+                </button>
+                <button
+                  type="button"
+                  className={[
+                    "h-8 rounded-md border text-xs font-medium transition active:translate-y-px",
+                    referenceImage.fit === "fill"
+                      ? "border-[#7e4e36] bg-[#7e4e36] text-[#fff9f0]"
+                      : "border-[#d8c4ad] bg-white text-[#4f392b]",
+                  ].join(" ")}
+                  onClick={() => resetReferenceFrame("fill")}
+                >
+                  Fill
+                </button>
+              </div>
+              <label className="mt-2 grid gap-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-[#765943]">
+                Opacity
+                <input
+                  aria-label="Reference image opacity"
+                  type="range"
+                  min="0.1"
+                  max="0.85"
+                  step="0.05"
+                  value={referenceImage.opacity}
+                  className="accent-[#7e4e36]"
+                  onChange={(event) =>
+                    updateActiveReferenceImage((current) => ({
+                      ...current,
+                      opacity: Number(event.target.value),
+                    }))
+                  }
+                />
+              </label>
+              <div className="mt-2 grid grid-cols-2 gap-1">
+                {patternJob.status === "working" ? (
+                  <button
+                    type="button"
+                    className={panelButtonClass()}
+                    onClick={cancelPatternPreview}
+                  >
+                    <X size={15} strokeWidth={1.8} />
+                    Cancel
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className={panelButtonClass("solid")}
+                    disabled={!referenceImage.width}
+                    onClick={generatePatternPreview}
+                  >
+                    <ScanLine size={15} strokeWidth={1.8} />
+                    Preview
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className={panelButtonClass(patternDraft ? "solid" : "quiet")}
+                  disabled={!patternDraft || patternDraft.stats.stitchedCells === 0}
+                  onClick={() => commitPatternDraft("fill")}
+                >
+                  <Check size={15} strokeWidth={1.8} />
+                  Add
+                </button>
+              </div>
+            </>
+          ) : null}
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <main className="h-[100dvh] max-h-[100dvh] overflow-hidden bg-[#f3ebdf] text-[#38271d]">
+      <div className={workspaceGridClass}>
         <section className={stagePanelClass}>
           {sharedProjectSource ? (
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#dec9b1] bg-[#f4e4d1] px-4 py-2.5">
@@ -3908,7 +4134,7 @@ export default function NeedlepointEditor() {
           <div
             ref={stageRef}
             className={[
-              "relative min-h-[clamp(520px,72dvh,880px)] flex-1 select-none overflow-hidden overscroll-contain bg-[#d6bd9f] touch-none xl:min-h-0",
+              "relative min-h-0 flex-1 select-none overflow-hidden overscroll-contain bg-[#d6bd9f] touch-none",
               tool === "image"
                 ? imageDrag
                   ? "cursor-grabbing"
@@ -3932,17 +4158,18 @@ export default function NeedlepointEditor() {
             <canvas ref={baseCanvasRef} className="absolute inset-0" />
             <canvas ref={stitchCanvasRef} className="absolute inset-0" />
             <canvas ref={previewCanvasRef} className="absolute inset-0" />
+            {primaryCanvasToolbar}
             <div
-              className="pointer-events-auto absolute w-[min(224px,calc(100%-1.5rem))]"
+              className="pointer-events-auto absolute z-10 w-[min(224px,calc(100%-5rem))]"
               style={{
                 right: "max(0.75rem, env(safe-area-inset-right))",
                 top: "max(4.9rem, calc(env(safe-area-inset-top) + 4.9rem))",
               }}
-              onPointerDown={(event) => event.stopPropagation()}
-              onPointerMove={(event) => event.stopPropagation()}
-              onPointerUp={(event) => event.stopPropagation()}
-              onPointerCancel={(event) => event.stopPropagation()}
-              onWheel={(event) => event.stopPropagation()}
+              onPointerDown={stopStageOverlayEvent}
+              onPointerMove={stopStageOverlayEvent}
+              onPointerUp={stopStageOverlayEvent}
+              onPointerCancel={stopStageOverlayEvent}
+              onWheel={stopStageOverlayEvent}
             >
               {quickColorCollapsed ? (
                 <button
@@ -4023,6 +4250,7 @@ export default function NeedlepointEditor() {
                 </div>
               )}
             </div>
+            {imageCanvasToolbar}
             {patternJob.status === "working" ? (
               <div
                 className="pointer-events-none absolute left-1/2 w-[min(320px,calc(100%-24px))] -translate-x-1/2 rounded-md border border-[#d6bfa6] bg-[#fff8ef]/94 px-3 py-3 shadow-[0_14px_28px_-22px_rgba(58,35,22,0.5)]"
@@ -4092,30 +4320,31 @@ export default function NeedlepointEditor() {
           </div>
         </section>
 
-        {rightPanelMode === "colorways" ? (
-          <ColorwayStudio
-            project={project}
-            initialRoleId={initialColorwayRoleId}
-            onPreview={handleColorwayPreview}
-            onCommit={commitColorwayProject}
-            onClose={closeColorwayStudio}
-            onCollapse={() => setPanelCollapsed(true)}
-            onExpand={() => setPanelCollapsed(false)}
-            collapsed={panelCollapsed}
-          />
-        ) : rightPanelMode === "share" ? (
-          <ShareProjectPanel
-            project={project}
-            rotation={view.rotation}
-            onOpenProject={openTemporaryProject}
-            onNotify={notify}
-            onClose={() => setRightPanelMode("inspector")}
-            onCollapse={() => setPanelCollapsed(true)}
-            onExpand={() => setPanelCollapsed(false)}
-            collapsed={panelCollapsed}
-          />
-        ) : panelCollapsed ? (
-          <aside className="order-3 flex items-center justify-between gap-2 rounded-lg border border-[#d6bfa6] bg-[#fff8ef] p-2 shadow-[0_20px_44px_-30px_rgba(87,55,35,0.32)] xl:min-h-[calc(100dvh-2rem)] xl:flex-col xl:justify-start xl:px-1">
+        <div className={sidePanelShellClass}>
+          {rightPanelMode === "colorways" ? (
+            <ColorwayStudio
+              project={project}
+              initialRoleId={initialColorwayRoleId}
+              onPreview={handleColorwayPreview}
+              onCommit={commitColorwayProject}
+              onClose={closeColorwayStudio}
+              onCollapse={() => setPanelCollapsed(true)}
+              onExpand={() => setPanelCollapsed(false)}
+              collapsed={panelCollapsed}
+            />
+          ) : rightPanelMode === "share" ? (
+            <ShareProjectPanel
+              project={project}
+              rotation={view.rotation}
+              onOpenProject={openTemporaryProject}
+              onNotify={notify}
+              onClose={() => setRightPanelMode("inspector")}
+              onCollapse={() => setPanelCollapsed(true)}
+              onExpand={() => setPanelCollapsed(false)}
+              collapsed={panelCollapsed}
+            />
+          ) : panelCollapsed ? (
+          <aside className="flex h-full min-h-0 items-center justify-between gap-2 rounded-lg border border-[#d6bfa6] bg-[#fff8ef] p-2 shadow-[0_20px_44px_-30px_rgba(87,55,35,0.32)] xl:flex-col xl:justify-start xl:px-1">
             <button
               type="button"
               aria-label={`Show ${activePanelLabel} panel`}
@@ -4129,8 +4358,8 @@ export default function NeedlepointEditor() {
               {activePanelLabel}
             </span>
           </aside>
-        ) : (
-        <aside className="order-3 flex flex-col gap-4 rounded-lg border border-[#d6bfa6] bg-[#fff8ef] p-4 shadow-[0_20px_44px_-30px_rgba(87,55,35,0.32)] xl:max-h-[calc(100dvh-2rem)] xl:overflow-auto">
+          ) : (
+        <aside className="flex h-full min-h-0 flex-col gap-4 overflow-auto rounded-lg border border-[#d6bfa6] bg-[#fff8ef] p-4 shadow-[0_20px_44px_-30px_rgba(87,55,35,0.32)]">
           <div className="flex items-center justify-between gap-3 border-b border-[#e4d2bf] pb-3">
             <span className="text-xs font-semibold uppercase tracking-[0.1em] text-[#765943]">
               Inspector
@@ -4978,7 +5207,8 @@ export default function NeedlepointEditor() {
             </dl>
           </section>
         </aside>
-        )}
+          )}
+        </div>
       </div>
       {showResetConfirm ? (
         <div

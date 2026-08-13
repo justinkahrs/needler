@@ -310,7 +310,7 @@ export default function ColorwayStudio({
 
   if (collapsed) {
     return (
-      <aside className="order-3 flex items-center justify-between gap-2 rounded-lg border border-[#d6bfa6] bg-[#fff8ef] p-2 shadow-[0_20px_44px_-30px_rgba(87,55,35,0.32)] xl:min-h-[calc(100dvh-2rem)] xl:flex-col xl:justify-start xl:px-1">
+      <aside className="flex h-full min-h-0 items-center justify-between gap-2 rounded-lg border border-[#d6bfa6] bg-[#fff8ef] p-2 shadow-[0_20px_44px_-30px_rgba(87,55,35,0.32)] xl:flex-col xl:justify-start xl:px-1">
         <button
           type="button"
           aria-label="Show Colorway Studio"
@@ -328,7 +328,7 @@ export default function ColorwayStudio({
   }
 
   return (
-    <aside className="order-3 flex flex-col rounded-lg border border-[#d6bfa6] bg-[#fff8ef] shadow-[0_20px_44px_-30px_rgba(87,55,35,0.32)] xl:max-h-[calc(100dvh-2rem)]">
+    <aside className="flex h-full min-h-0 flex-col rounded-lg border border-[#d6bfa6] bg-[#fff8ef] shadow-[0_20px_44px_-30px_rgba(87,55,35,0.32)]">
       <header className="flex items-center gap-3 border-b border-[#e4d2bf] p-4">
         <button
           type="button"
