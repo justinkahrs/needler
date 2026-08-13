@@ -165,6 +165,22 @@ type HoleFill = {
   green: number;
   blue: number;
 };
+
+type CanvasBuffer = HTMLCanvasElement | OffscreenCanvas;
+type SheetLayerCache = {
+  underlay: CanvasBuffer;
+  overlay: CanvasBuffer;
+  width: number;
+  height: number;
+  margin: number;
+};
+type WorldBounds = {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+};
+
 type EditorState = {
   project: Project;
   past: Project[];
@@ -194,6 +210,8 @@ const REFERENCE_MAX_SCALE = 4;
 const DOUBLE_TAP_MAX_DELAY_MS = 320;
 const DOUBLE_TAP_MAX_DISTANCE = 34;
 const TAP_MOVE_TOLERANCE = 8;
+const MAX_STAGE_RENDER_SCALE = 2;
+const SHEET_CACHE_MARGIN = 36;
 const EXPORT_SCALE = 3;
 const PATTERN_SAMPLE_SCALE = 4;
 const DEFAULT_PATTERN_SETTINGS: PatternSettings = {
@@ -513,6 +531,67 @@ function screenToWorld(
   return screenToWorldPoint(point, view, getWorldCenter(canvas));
 }
 
+function getVisibleWorldBounds(
+  view: ViewState,
+  viewport: Point,
+  canvas: Project["canvas"],
+  screenPadding = 96,
+): WorldBounds | null {
+  if (viewport.x <= 0 || viewport.y <= 0) {
+    return null;
+  }
+
+  const corners = [
+    screenToWorld({ x: 0, y: 0 }, view, canvas),
+    screenToWorld({ x: viewport.x, y: 0 }, view, canvas),
+    screenToWorld({ x: viewport.x, y: viewport.y }, view, canvas),
+    screenToWorld({ x: 0, y: viewport.y }, view, canvas),
+  ];
+  const padding = screenPadding / Math.max(view.zoom, MIN_ZOOM);
+
+  return {
+    minX: Math.min(...corners.map((point) => point.x)) - padding,
+    minY: Math.min(...corners.map((point) => point.y)) - padding,
+    maxX: Math.max(...corners.map((point) => point.x)) + padding,
+    maxY: Math.max(...corners.map((point) => point.y)) + padding,
+  };
+}
+
+function segmentIntersectsBounds(
+  start: Point,
+  end: Point,
+  bounds: WorldBounds | null | undefined,
+  margin = 0,
+) {
+  if (!bounds) {
+    return true;
+  }
+
+  return !(
+    Math.max(start.x, end.x) < bounds.minX - margin ||
+    Math.min(start.x, end.x) > bounds.maxX + margin ||
+    Math.max(start.y, end.y) < bounds.minY - margin ||
+    Math.min(start.y, end.y) > bounds.maxY + margin
+  );
+}
+
+function pointIntersectsBounds(
+  point: Point,
+  bounds: WorldBounds | null | undefined,
+  margin = 0,
+) {
+  if (!bounds) {
+    return true;
+  }
+
+  return (
+    point.x >= bounds.minX - margin &&
+    point.x <= bounds.maxX + margin &&
+    point.y >= bounds.minY - margin &&
+    point.y <= bounds.maxY + margin
+  );
+}
+
 function nearestHole(point: Point, canvas: Project["canvas"]): Hole | null {
   const spacing = getGridSpacing(canvas);
   const padding = getGridPadding(canvas);
@@ -657,22 +736,44 @@ function roundedRect(
   ctx.closePath();
 }
 
+function getStageRenderScale() {
+  if (typeof window === "undefined") {
+    return 1;
+  }
+
+  return clamp(window.devicePixelRatio || 1, 1, MAX_STAGE_RENDER_SCALE);
+}
+
 function prepareCanvas(
   canvas: HTMLCanvasElement | null,
   viewport: Point,
+  renderScale: number,
 ): CanvasRenderingContext2D | null {
   if (!canvas || viewport.x <= 0 || viewport.y <= 0) {
     return null;
   }
 
-  const dpr = window.devicePixelRatio || 1;
+  const dpr = clamp(renderScale || 1, 1, MAX_STAGE_RENDER_SCALE);
   const width = Math.floor(viewport.x);
   const height = Math.floor(viewport.y);
+  const pixelWidth = Math.max(1, Math.floor(width * dpr));
+  const pixelHeight = Math.max(1, Math.floor(height * dpr));
 
-  canvas.width = Math.floor(width * dpr);
-  canvas.height = Math.floor(height * dpr);
-  canvas.style.width = `${width}px`;
-  canvas.style.height = `${height}px`;
+  if (canvas.width !== pixelWidth) {
+    canvas.width = pixelWidth;
+  }
+  if (canvas.height !== pixelHeight) {
+    canvas.height = pixelHeight;
+  }
+
+  const styleWidth = `${width}px`;
+  const styleHeight = `${height}px`;
+  if (canvas.style.width !== styleWidth) {
+    canvas.style.width = styleWidth;
+  }
+  if (canvas.style.height !== styleHeight) {
+    canvas.style.height = styleHeight;
+  }
 
   const ctx = canvas.getContext("2d");
 
@@ -684,6 +785,37 @@ function prepareCanvas(
   ctx.clearRect(0, 0, width, height);
 
   return ctx;
+}
+
+function createCanvasBuffer(width: number, height: number): CanvasBuffer | null {
+  const pixelWidth = Math.max(1, Math.ceil(width));
+  const pixelHeight = Math.max(1, Math.ceil(height));
+
+  if (typeof OffscreenCanvas !== "undefined") {
+    try {
+      const canvas = new OffscreenCanvas(pixelWidth, pixelHeight);
+
+      if (canvas.getContext("2d")) {
+        return canvas;
+      }
+    } catch {
+      // Fall back to a DOM canvas below.
+    }
+  }
+
+  if (typeof document === "undefined") {
+    return null;
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = pixelWidth;
+  canvas.height = pixelHeight;
+
+  return canvas;
+}
+
+function getCanvasBufferContext(buffer: CanvasBuffer) {
+  return buffer.getContext("2d") as CanvasRenderingContext2D | null;
 }
 
 function getPatternBounds(canvas: Project["canvas"]) {
@@ -753,8 +885,25 @@ function drawPerforatedSheet(
   project: Project,
   referenceImage?: { image: HTMLImageElement; state: ReferenceImageState } | null,
 ) {
-  const world = getWorldSize(project.canvas);
-  const holeRadius = getHoleRadius(project.canvas);
+  drawPerforatedSheetUnderlay(ctx, project.canvas);
+
+  if (referenceImage) {
+    drawReferenceImage(
+      ctx,
+      referenceImage.image,
+      getPatternBounds(project.canvas),
+      referenceImage.state,
+    );
+  }
+
+  drawPerforatedSheetOverlay(ctx, project.canvas);
+}
+
+function drawPerforatedSheetUnderlay(
+  ctx: CanvasRenderingContext2D,
+  canvas: Project["canvas"],
+) {
+  const world = getWorldSize(canvas);
 
   ctx.save();
   ctx.shadowColor = "rgba(80, 48, 28, 0.16)";
@@ -775,15 +924,19 @@ function drawPerforatedSheet(
   fiberGradient.addColorStop(1, "rgba(87, 52, 34, 0.11)");
   ctx.fillStyle = fiberGradient;
   ctx.fillRect(0, 0, world.width, world.height);
+  ctx.restore();
+}
 
-  if (referenceImage) {
-    drawReferenceImage(
-      ctx,
-      referenceImage.image,
-      getPatternBounds(project.canvas),
-      referenceImage.state,
-    );
-  }
+function drawPerforatedSheetOverlay(
+  ctx: CanvasRenderingContext2D,
+  canvas: Project["canvas"],
+) {
+  const world = getWorldSize(canvas);
+  const holeRadius = getHoleRadius(canvas);
+
+  ctx.save();
+  roundedRect(ctx, 0, 0, world.width, world.height, 8);
+  ctx.clip();
 
   for (let y = 8; y < world.height; y += 13) {
     ctx.beginPath();
@@ -794,9 +947,9 @@ function drawPerforatedSheet(
     ctx.stroke();
   }
 
-  for (let row = 0; row < project.canvas.rows; row += 1) {
-    for (let col = 0; col < project.canvas.cols; col += 1) {
-      const point = holeToWorld({ col, row }, project.canvas);
+  for (let row = 0; row < canvas.rows; row += 1) {
+    for (let col = 0; col < canvas.cols; col += 1) {
+      const point = holeToWorld({ col, row }, canvas);
 
       ctx.beginPath();
       ctx.arc(point.x, point.y, holeRadius, 0, Math.PI * 2);
@@ -817,6 +970,102 @@ function drawPerforatedSheet(
   ctx.stroke();
 
   ctx.restore();
+}
+
+const sheetLayerCache = new WeakMap<Project["canvas"], SheetLayerCache>();
+
+function renderSheetCacheLayer(
+  buffer: CanvasBuffer,
+  margin: number,
+  drawLayer: (ctx: CanvasRenderingContext2D) => void,
+) {
+  const ctx = getCanvasBufferContext(buffer);
+
+  if (!ctx) {
+    return false;
+  }
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, buffer.width, buffer.height);
+  ctx.save();
+  ctx.translate(margin, margin);
+  drawLayer(ctx);
+  ctx.restore();
+
+  return true;
+}
+
+function getSheetLayerCache(canvas: Project["canvas"]) {
+  const cached = sheetLayerCache.get(canvas);
+
+  if (cached) {
+    return cached;
+  }
+
+  const world = getWorldSize(canvas);
+  const margin = SHEET_CACHE_MARGIN;
+  const width = Math.ceil(world.width + margin * 2);
+  const height = Math.ceil(world.height + margin * 2);
+  const underlay = createCanvasBuffer(width, height);
+  const overlay = createCanvasBuffer(width, height);
+
+  if (!underlay || !overlay) {
+    return null;
+  }
+
+  const didRenderUnderlay = renderSheetCacheLayer(underlay, margin, (ctx) =>
+    drawPerforatedSheetUnderlay(ctx, canvas),
+  );
+  const didRenderOverlay = renderSheetCacheLayer(overlay, margin, (ctx) =>
+    drawPerforatedSheetOverlay(ctx, canvas),
+  );
+
+  if (!didRenderUnderlay || !didRenderOverlay) {
+    return null;
+  }
+
+  const cache = { underlay, overlay, width, height, margin };
+  sheetLayerCache.set(canvas, cache);
+
+  return cache;
+}
+
+function drawCachedPerforatedSheet(
+  ctx: CanvasRenderingContext2D,
+  project: Project,
+  referenceImage?: { image: HTMLImageElement; state: ReferenceImageState } | null,
+) {
+  const cache = getSheetLayerCache(project.canvas);
+
+  if (!cache) {
+    drawPerforatedSheet(ctx, project, referenceImage);
+    return;
+  }
+
+  ctx.drawImage(
+    cache.underlay,
+    -cache.margin,
+    -cache.margin,
+    cache.width,
+    cache.height,
+  );
+
+  if (referenceImage) {
+    drawReferenceImage(
+      ctx,
+      referenceImage.image,
+      getPatternBounds(project.canvas),
+      referenceImage.state,
+    );
+  }
+
+  ctx.drawImage(
+    cache.overlay,
+    -cache.margin,
+    -cache.margin,
+    cache.width,
+    cache.height,
+  );
 }
 
 function drawThreadStitch(
@@ -905,6 +1154,7 @@ function drawHoleThreadFill(
   ctx: CanvasRenderingContext2D,
   project: Project,
   fillMap = getHoleFillMap(project),
+  visibleBounds?: WorldBounds | null,
 ) {
   const holeRadius = getHoleRadius(project.canvas);
 
@@ -915,6 +1165,10 @@ function drawHoleThreadFill(
 
     const [col, row] = key.split(":").map(Number);
     const point = holeToWorld({ col, row }, project.canvas);
+    if (!pointIntersectsBounds(point, visibleBounds, holeRadius * 2)) {
+      continue;
+    }
+
     const loadRatio = clamp(fill.load / MAX_HOLE_STRAND_UNITS, 0, 1);
     const radius = holeRadius * (0.42 + loadRatio * 0.52);
     const red = Math.round(fill.red / fill.load);
@@ -1031,6 +1285,7 @@ function drawStitches(
   ctx: CanvasRenderingContext2D,
   project: Project,
   assignments?: Record<string, string>,
+  visibleBounds?: WorldBounds | null,
 ) {
   if (project.stitches.length > 1200) {
     drawDenseStitches(ctx, project, assignments);
@@ -1042,12 +1297,24 @@ function drawStitches(
   for (const stitch of project.stitches) {
     const color = rolePalette.get(stitch.colorRoleId)?.hex ?? project.palette[0]?.hex;
 
-    if (color) {
+    if (!color) {
+      continue;
+    }
+
+    const start = holeToWorld(stitch.from, project.canvas);
+    const end = holeToWorld(stitch.to, project.canvas);
+
+    if (segmentIntersectsBounds(start, end, visibleBounds, getStitchWidth(stitch) * 2)) {
       drawThreadStitch(ctx, stitch, color, project.canvas);
     }
   }
 
-  drawHoleThreadFill(ctx, project, getHoleFillMap(project, rolePalette));
+  drawHoleThreadFill(
+    ctx,
+    project,
+    getHoleFillMap(project, rolePalette),
+    visibleBounds,
+  );
 }
 
 function getPatternStitchHoles(
@@ -1093,16 +1360,75 @@ function getDraftGroups(draft: PatternDraft, canvas: Project["canvas"]) {
   return groups;
 }
 
+function getVisibleDraftGroups(
+  draft: PatternDraft,
+  canvas: Project["canvas"],
+  visibleBounds: WorldBounds,
+) {
+  const spacing = getGridSpacing(canvas);
+  const padding = getGridPadding(canvas);
+  const minCol = Math.max(
+    0,
+    Math.floor((visibleBounds.minX - padding) / spacing) - 2,
+  );
+  const maxCol = Math.min(
+    draft.cols - 1,
+    Math.ceil((visibleBounds.maxX - padding) / spacing) + 2,
+  );
+  const minRow = Math.max(
+    0,
+    Math.floor((visibleBounds.minY - padding) / spacing) - 2,
+  );
+  const maxRow = Math.min(
+    draft.rows - 1,
+    Math.ceil((visibleBounds.maxY - padding) / spacing) + 2,
+  );
+  const groups = draft.colors.map((usage) => ({
+    path: new Path2D(),
+    colorRoleId: usage.color.id,
+    width: getThreadWidthForStrands(draft.settings.strands),
+  }));
+
+  if (maxCol < minCol || maxRow < minRow) {
+    return groups;
+  }
+
+  for (let row = minRow; row <= maxRow; row += 1) {
+    for (let col = minCol; col <= maxCol; col += 1) {
+      const index = row * draft.cols + col;
+      const colorIndex = draft.cells[index];
+      if (colorIndex === 0) continue;
+      const holes = getPatternStitchHoles(col, row, draft.settings.direction);
+      const start = holeToWorld(holes.from, canvas);
+      const end = holeToWorld(holes.to, canvas);
+
+      if (!segmentIntersectsBounds(start, end, visibleBounds, spacing * 2)) {
+        continue;
+      }
+
+      const path = groups[colorIndex - 1]?.path;
+      if (!path) continue;
+      path.moveTo(start.x, start.y);
+      path.lineTo(end.x, end.y);
+    }
+  }
+
+  return groups;
+}
+
 function drawPatternDraft(
   ctx: CanvasRenderingContext2D,
   draft: PatternDraft,
   canvas: Project["canvas"],
+  visibleBounds?: WorldBounds | null,
 ) {
   ctx.save();
   ctx.globalAlpha = 0.9;
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
-  const groups = getDraftGroups(draft, canvas);
+  const groups = visibleBounds
+    ? getVisibleDraftGroups(draft, canvas, visibleBounds)
+    : getDraftGroups(draft, canvas);
   for (let index = 0; index < groups.length; index += 1) {
     const group = groups[index];
     const color = draft.colors[index]?.color.hex;
@@ -1610,6 +1936,7 @@ export default function NeedlepointEditor() {
   const [customHex, setCustomHex] = useState("#c72b3b");
   const [customName, setCustomName] = useState("Custom thread");
   const [viewport, setViewport] = useState<Point>({ x: 0, y: 0 });
+  const [stageRenderScale, setStageRenderScale] = useState(1);
   const [view, setView] = useState<ViewState>({
     zoom: 1,
     pan: { x: 0, y: 0 },
@@ -1656,6 +1983,9 @@ export default function NeedlepointEditor() {
   const gestureSessionRef = useRef<StageGestureSession | null>(null);
   const tapCandidateRef = useRef<StageTapCandidate | null>(null);
   const lastTapRef = useRef<{ point: Point; time: number } | null>(null);
+  const viewRef = useRef<ViewState>(view);
+  const pendingViewRef = useRef<ViewState | null>(null);
+  const viewFrameRef = useRef<number | null>(null);
 
   const meshCount = getMeshCount(project.canvas);
   const physicalWidth = project.canvas.widthIn;
@@ -1698,6 +2028,10 @@ export default function NeedlepointEditor() {
   const usedResolvedColors = useMemo(
     () => getUsedResolvedColors(project),
     [project],
+  );
+  const visibleWorldBounds = useMemo(
+    () => getVisibleWorldBounds(view, viewport, project.canvas),
+    [project.canvas, view, viewport],
   );
   const threadSwatchColors = useMemo(
     () =>
@@ -1782,13 +2116,54 @@ export default function NeedlepointEditor() {
     [viewport],
   );
 
+  const updateView = useCallback(
+    (
+      nextView:
+        | ViewState
+        | ((current: ViewState) => ViewState),
+      immediate = false,
+    ) => {
+      const current = pendingViewRef.current ?? viewRef.current;
+      const resolved =
+        typeof nextView === "function" ? nextView(current) : nextView;
+
+      viewRef.current = resolved;
+      pendingViewRef.current = resolved;
+
+      if (immediate || typeof window === "undefined") {
+        if (viewFrameRef.current !== null) {
+          window.cancelAnimationFrame(viewFrameRef.current);
+          viewFrameRef.current = null;
+        }
+        pendingViewRef.current = null;
+        setView(resolved);
+        return resolved;
+      }
+
+      if (viewFrameRef.current === null) {
+        viewFrameRef.current = window.requestAnimationFrame(() => {
+          viewFrameRef.current = null;
+          const pending = pendingViewRef.current;
+          pendingViewRef.current = null;
+
+          if (pending) {
+            setView(pending);
+          }
+        });
+      }
+
+      return resolved;
+    },
+    [],
+  );
+
   const fitViewToCanvas = useCallback(
     (canvas: Project["canvas"], rotation?: number) => {
-      setView((current) =>
+      updateView((current) =>
         getFittedView(canvas, rotation ?? current.rotation),
       );
     },
-    [getFittedView],
+    [getFittedView, updateView],
   );
 
   const fitView = useCallback(() => {
@@ -1796,7 +2171,7 @@ export default function NeedlepointEditor() {
   }, [fitViewToCanvas, project.canvas]);
 
   const zoomAt = useCallback((screenPoint: Point, zoomFactor: number) => {
-    setView((current) => {
+    updateView((current) => {
       return zoomViewAtPoint({
         view: current,
         screenPoint,
@@ -1806,7 +2181,21 @@ export default function NeedlepointEditor() {
         maxZoom: MAX_ZOOM,
       });
     });
-  }, [project.canvas]);
+  }, [project.canvas, updateView]);
+
+  useEffect(() => {
+    if (!pendingViewRef.current) {
+      viewRef.current = view;
+    }
+  }, [view]);
+
+  useEffect(() => {
+    return () => {
+      if (viewFrameRef.current !== null) {
+        window.cancelAnimationFrame(viewFrameRef.current);
+      }
+    };
+  }, []);
 
   const commitProject = useCallback((nextProject: Project) => {
     dispatch({ type: "commit", project: nextProject });
@@ -1846,10 +2235,10 @@ export default function NeedlepointEditor() {
           const sharedProject = normalizeProject(shared.project);
           dispatch({ type: "hydrate", project: sharedProject });
           setSharedProjectSource("url");
-          setView((current) => ({
+          updateView((current) => ({
             ...current,
             rotation: shared.rotation,
-          }));
+          }), true);
           hasFitViewRef.current = false;
           const firstUsedColor = getUsedResolvedColors(sharedProject)[0]?.color.id;
           if (firstUsedColor) setSelectedColorId(firstUsedColor);
@@ -1873,7 +2262,7 @@ export default function NeedlepointEditor() {
     return () => {
       active = false;
     };
-  }, [notify]);
+  }, [notify, updateView]);
 
   useEffect(() => {
     if (!state.hydrated || sharedProjectSource) {
@@ -1893,7 +2282,7 @@ export default function NeedlepointEditor() {
 
   useEffect(() => {
     if (!state.hydrated || sharedProjectSource) return;
-    localWorkspaceRef.current = { project, rotation: view.rotation };
+    localWorkspaceRef.current = { project, rotation: viewRef.current.rotation };
   }, [project, sharedProjectSource, state.hydrated, view.rotation]);
 
   useEffect(() => {
@@ -1968,14 +2357,19 @@ export default function NeedlepointEditor() {
         x: stage.clientWidth,
         y: stage.clientHeight,
       });
+      setStageRenderScale(getStageRenderScale());
     };
 
     updateSize();
 
     const observer = new ResizeObserver(updateSize);
     observer.observe(stage);
+    window.addEventListener("resize", updateSize);
 
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", updateSize);
+    };
   }, []);
 
   useEffect(() => {
@@ -1986,7 +2380,7 @@ export default function NeedlepointEditor() {
   }, [fitView, viewport]);
 
   useEffect(() => {
-    const ctx = prepareCanvas(baseCanvasRef.current, viewport);
+    const ctx = prepareCanvas(baseCanvasRef.current, viewport, stageRenderScale);
 
     if (!ctx) {
       return;
@@ -1994,7 +2388,7 @@ export default function NeedlepointEditor() {
 
     ctx.save();
     applyViewTransform(ctx, view, project.canvas);
-    drawPerforatedSheet(
+    drawCachedPerforatedSheet(
       ctx,
       project,
       referenceElementRef.current &&
@@ -2007,10 +2401,10 @@ export default function NeedlepointEditor() {
         : null,
     );
     ctx.restore();
-  }, [patternDraft, previewMode, project, referenceImage, view, viewport]);
+  }, [patternDraft, previewMode, project, referenceImage, stageRenderScale, view, viewport]);
 
   useEffect(() => {
-    const ctx = prepareCanvas(stitchCanvasRef.current, viewport);
+    const ctx = prepareCanvas(stitchCanvasRef.current, viewport, stageRenderScale);
 
     if (!ctx) {
       return;
@@ -2019,13 +2413,26 @@ export default function NeedlepointEditor() {
     ctx.save();
     applyViewTransform(ctx, view, project.canvas);
     if (!patternDraft) {
-      drawStitches(ctx, project, colorwayPreview ?? undefined);
+      drawStitches(
+        ctx,
+        project,
+        colorwayPreview ?? undefined,
+        visibleWorldBounds,
+      );
     }
     ctx.restore();
-  }, [colorwayPreview, patternDraft, project, view, viewport]);
+  }, [
+    colorwayPreview,
+    patternDraft,
+    project,
+    stageRenderScale,
+    view,
+    viewport,
+    visibleWorldBounds,
+  ]);
 
   useEffect(() => {
-    const ctx = prepareCanvas(previewCanvasRef.current, viewport);
+    const ctx = prepareCanvas(previewCanvasRef.current, viewport, stageRenderScale);
 
     if (!ctx) {
       return;
@@ -2034,7 +2441,7 @@ export default function NeedlepointEditor() {
     ctx.save();
     applyViewTransform(ctx, view, project.canvas);
     if (patternDraft && previewMode !== "image") {
-      drawPatternDraft(ctx, patternDraft, project.canvas);
+      drawPatternDraft(ctx, patternDraft, project.canvas, visibleWorldBounds);
     }
     const dragCapacity =
       drag?.from && drag.to && !sameHole(drag.from, drag.to)
@@ -2124,8 +2531,10 @@ export default function NeedlepointEditor() {
     strandCount,
     strandWidth,
     tool,
+    stageRenderScale,
     view,
     viewport,
+    visibleWorldBounds,
   ]);
 
   useEffect(() => {
@@ -2179,7 +2588,7 @@ export default function NeedlepointEditor() {
       distanceBetween(previous.point, screenPoint) <= DOUBLE_TAP_MAX_DISTANCE
     ) {
       lastTapRef.current = null;
-      setView((current) => {
+      updateView((current) => {
         const fitView = getFittedView(project.canvas, current.rotation);
         const workingZoom = Math.max(fitView.zoom * 2.35, 0.9);
 
@@ -2234,7 +2643,7 @@ export default function NeedlepointEditor() {
     clearPendingStageEdits();
     gestureSessionRef.current = {
       startFrame: getGestureFrame(pointers[0].point, pointers[1].point),
-      startView: view,
+      startView: viewRef.current,
       intent: tool === "image" && referenceImage ? "pending" : "viewport",
       startReference: referenceImage
         ? {
@@ -2327,7 +2736,7 @@ export default function NeedlepointEditor() {
       return true;
     }
 
-    setView(
+    updateView(
       applyViewportGesture({
         startView: session.startView,
         startFrame: session.startFrame,
@@ -2401,12 +2810,13 @@ export default function NeedlepointEditor() {
       setPanDrag({
         pointerId: event.pointerId,
         start: screenPoint,
-        origin: view.pan,
+        origin: viewRef.current.pan,
       });
       return;
     }
 
-    const worldPoint = screenToWorld(screenPoint, view, project.canvas);
+    const currentView = viewRef.current;
+    const worldPoint = screenToWorld(screenPoint, currentView, project.canvas);
 
     if (tool === "image") {
       if (!referenceImage) {
@@ -2445,7 +2855,7 @@ export default function NeedlepointEditor() {
     }
 
     if (tool === "erase") {
-      const target = findNearestStitch(worldPoint, project, view);
+      const target = findNearestStitch(worldPoint, project, currentView);
 
       if (!target) {
         notify("No stitch selected.", "warn");
@@ -2510,7 +2920,7 @@ export default function NeedlepointEditor() {
     }
 
     if (panDrag && panDrag.pointerId === event.pointerId) {
-      setView((current) => ({
+      updateView((current) => ({
         ...current,
         pan: {
           x: panDrag.origin.x + screenPoint.x - panDrag.start.x,
@@ -2520,7 +2930,8 @@ export default function NeedlepointEditor() {
       return;
     }
 
-    const worldPoint = screenToWorld(screenPoint, view, project.canvas);
+    const currentView = viewRef.current;
+    const worldPoint = screenToWorld(screenPoint, currentView, project.canvas);
 
     if (imageDrag && imageDrag.pointerId === event.pointerId && referenceImage) {
       const bounds = getPatternBounds(project.canvas);
@@ -2545,7 +2956,9 @@ export default function NeedlepointEditor() {
 
     if (tool === "erase") {
       setHoverHole(nearestHole(worldPoint, project.canvas));
-      setHoveredStitchId(findNearestStitch(worldPoint, project, view)?.id ?? null);
+      setHoveredStitchId(
+        findNearestStitch(worldPoint, project, currentView)?.id ?? null,
+      );
       return;
     }
 
@@ -2595,7 +3008,10 @@ export default function NeedlepointEditor() {
 
     const destination =
       screenPoint
-        ? nearestHole(screenToWorld(screenPoint, view, project.canvas), project.canvas)
+        ? nearestHole(
+            screenToWorld(screenPoint, viewRef.current, project.canvas),
+            project.canvas,
+          )
         : drag.to;
 
     setDrag(null);
@@ -2738,7 +3154,7 @@ export default function NeedlepointEditor() {
   const openTemporaryProject = useCallback(
     (shared: DecodedShareProject, source: "url" | "file") => {
       if (!sharedProjectSource) {
-        localWorkspaceRef.current = { project, rotation: view.rotation };
+        localWorkspaceRef.current = { project, rotation: viewRef.current.rotation };
       }
       const nextProject = normalizeProject(shared.project);
       patternWorkerRef.current?.terminate();
@@ -2753,18 +3169,18 @@ export default function NeedlepointEditor() {
       setRightPanelMode("inspector");
       dispatch({ type: "hydrate", project: nextProject });
       setSharedProjectSource(source);
-      setView((current) => ({ ...current, rotation: shared.rotation }));
+      updateView((current) => ({ ...current, rotation: shared.rotation }), true);
       hasFitViewRef.current = false;
       const firstUsedColor = getUsedResolvedColors(nextProject)[0]?.color.id;
       if (firstUsedColor) setSelectedColorId(firstUsedColor);
     },
-    [project, sharedProjectSource, view.rotation],
+    [project, sharedProjectSource, updateView],
   );
 
   const saveSharedProjectLocally = () => {
     try {
       window.localStorage.setItem(PROJECT_STORAGE_KEY, serializeProject(project));
-      localWorkspaceRef.current = { project, rotation: view.rotation };
+      localWorkspaceRef.current = { project, rotation: viewRef.current.rotation };
       setSharedProjectSource(null);
       clearSharedProjectHash();
       notify("Shared project saved locally.", "success");
@@ -2785,13 +3201,13 @@ export default function NeedlepointEditor() {
     setColorwayPreview(null);
     setInitialColorwayRoleId(undefined);
     setRightPanelMode("inspector");
-    setView((current) => ({ ...current, rotation: local.rotation }));
+    updateView((current) => ({ ...current, rotation: local.rotation }), true);
     hasFitViewRef.current = false;
     clearSharedProjectHash();
     const firstUsedColor = getUsedResolvedColors(local.project)[0]?.color.id;
     if (firstUsedColor) setSelectedColorId(firstUsedColor);
     notify("Returned to the locally saved project.", "info");
-  }, [notify]);
+  }, [notify, updateView]);
 
   useEffect(() => {
     if (!state.hydrated) return;
@@ -2861,14 +3277,14 @@ export default function NeedlepointEditor() {
   };
 
   const rotateViewBy = (degrees: number) => {
-    setView((current) => ({
+    updateView((current) => ({
       ...current,
       rotation: normalizeViewRotation(current.rotation + degrees),
     }));
   };
 
   const changeViewRotation = (degrees: number) => {
-    setView((current) => ({
+    updateView((current) => ({
       ...current,
       rotation: normalizeViewRotation(degrees),
     }));
