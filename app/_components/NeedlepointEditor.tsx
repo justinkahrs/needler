@@ -1159,8 +1159,10 @@ function drawThreadStitch(
   ctx.save();
   ctx.globalAlpha = alpha;
   threadCapsulePath(ctx, renderStart, renderEnd, threadWidth / 2);
+  ctx.fillStyle = color;
+  ctx.fill();
   ctx.clip();
-  ctx.lineCap = "butt";
+  ctx.lineCap = "round";
   ctx.lineJoin = "round";
 
   for (let index = 0; index < ridgeCount; index += 1) {
