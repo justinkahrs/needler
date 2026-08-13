@@ -9,6 +9,7 @@ import {
   ImageOff,
   ImagePlus,
   Layers3,
+  LoaderCircle,
   Maximize2,
   Minus,
   Move,
@@ -25,6 +26,7 @@ import {
   Save,
   ScanLine,
   Share2,
+  Trash2,
   Undo2,
   X,
 } from "lucide-react";
@@ -54,6 +56,13 @@ import {
   getShareTokenFromHash,
 } from "@/app/_lib/shareProject";
 import type { DecodedShareProject } from "@/app/_lib/shareProject";
+import {
+  getActiveReferenceImage,
+  makeReferenceImageState,
+  nextActiveReferenceImageIdAfterRemoval,
+  updateReferenceImage,
+} from "@/app/_lib/referenceImages";
+import type { ReferenceImageState } from "@/app/_lib/referenceImages";
 import {
   MAX_HOLE_STRAND_UNITS,
   canAddStitch,
@@ -101,15 +110,6 @@ import {
 import type { ReactNode } from "react";
 
 type Tool = "stitch" | "erase" | "pan" | "image" | "eyedropper";
-type ReferenceImageState = {
-  src: string;
-  name: string;
-  opacity: number;
-  width: number | null;
-  height: number | null;
-  fit: "fit" | "fill";
-  transform: ReferenceTransform;
-};
 type PreviewMode = "image" | "pattern" | "both";
 type RightPanelMode = "inspector" | "colorways" | "share";
 type DragState = { from: Hole; to: Hole | null } | null;
@@ -167,6 +167,10 @@ type HoleFill = {
 };
 
 type CanvasBuffer = HTMLCanvasElement | OffscreenCanvas;
+type RenderedReferenceImage = {
+  image: HTMLImageElement;
+  state: ReferenceImageState;
+};
 type SheetLayerCache = {
   underlay: CanvasBuffer;
   overlay: CanvasBuffer;
@@ -911,11 +915,11 @@ function drawReferenceImage(
 function drawPerforatedSheet(
   ctx: CanvasRenderingContext2D,
   project: Project,
-  referenceImage?: { image: HTMLImageElement; state: ReferenceImageState } | null,
+  referenceImages: RenderedReferenceImage[] = [],
 ) {
   drawPerforatedSheetUnderlay(ctx, project.canvas);
 
-  if (referenceImage) {
+  for (const referenceImage of referenceImages) {
     drawReferenceImage(
       ctx,
       referenceImage.image,
@@ -1061,12 +1065,12 @@ function getSheetLayerCache(canvas: Project["canvas"]) {
 function drawCachedPerforatedSheet(
   ctx: CanvasRenderingContext2D,
   project: Project,
-  referenceImage?: { image: HTMLImageElement; state: ReferenceImageState } | null,
+  referenceImages: RenderedReferenceImage[] = [],
 ) {
   const cache = getSheetLayerCache(project.canvas);
 
   if (!cache) {
-    drawPerforatedSheet(ctx, project, referenceImage);
+    drawPerforatedSheet(ctx, project, referenceImages);
     return;
   }
 
@@ -1078,7 +1082,7 @@ function drawCachedPerforatedSheet(
     cache.height,
   );
 
-  if (referenceImage) {
+  for (const referenceImage of referenceImages) {
     drawReferenceImage(
       ctx,
       referenceImage.image,
@@ -1971,6 +1975,8 @@ export default function NeedlepointEditor() {
   const [hoveredStitchId, setHoveredStitchId] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [exporting, setExporting] = useState(false);
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [quickColorCollapsed, setQuickColorCollapsed] = useState(false);
   const [dmcQuery, setDmcQuery] = useState("");
   const [customHex, setCustomHex] = useState("#c72b3b");
   const [customName, setCustomName] = useState("Custom thread");
@@ -1981,8 +1987,12 @@ export default function NeedlepointEditor() {
     pan: { x: 0, y: 0 },
     rotation: 0,
   });
-  const [referenceImage, setReferenceImage] =
-    useState<ReferenceImageState | null>(null);
+  const [referenceImages, setReferenceImages] = useState<ReferenceImageState[]>(
+    [],
+  );
+  const [activeReferenceImageId, setActiveReferenceImageId] = useState<
+    string | null
+  >(null);
   const [previewMode, setPreviewMode] = useState<PreviewMode>("both");
   const [patternSettings, setPatternSettings] = useState<PatternSettings>(
     DEFAULT_PATTERN_SETTINGS,
@@ -2011,9 +2021,10 @@ export default function NeedlepointEditor() {
   const baseCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const stitchCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const previewCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const referenceElementRef = useRef<HTMLImageElement | null>(null);
+  const referenceElementMapRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const patternWorkerRef = useRef<Worker | null>(null);
   const pdfWorkerRef = useRef<Worker | null>(null);
+  const pdfExportIdRef = useRef(0);
   const hasFitViewRef = useRef(false);
   const localWorkspaceRef = useRef<{ project: Project; rotation: number } | null>(
     null,
@@ -2045,7 +2056,11 @@ export default function NeedlepointEditor() {
   const activeColorId =
     selectedColor?.id ?? project.palette[0]?.id ?? INITIAL_SELECTED_COLOR_ID;
   const activePreviewColor = selectedColor?.hex ?? "#559392";
-  const referenceSrc = referenceImage?.src ?? null;
+  const referenceImage = useMemo(
+    () => getActiveReferenceImage(referenceImages, activeReferenceImageId),
+    [activeReferenceImageId, referenceImages],
+  );
+  const resolvedActiveReferenceImageId = referenceImage?.id ?? null;
   const newPatternColors = patternDraft?.colors.filter((usage) => !usage.existing) ?? [];
   const paletteIds = useMemo(
     () => new Set(project.palette.map((color) => color.id)),
@@ -2084,10 +2099,63 @@ export default function NeedlepointEditor() {
       (colorway) => colorway.id === project.colors.activeColorwayId,
     )?.name ??
     (Object.keys(project.colors.current).length > 0 ? "Modified" : "Original");
+  const editorStatusLabel = state.hydrated
+    ? sharedProjectSource
+      ? "Temporary copy"
+      : "Saved locally"
+    : "Loading";
+  const isPdfExporting = pdfJob.status === "working";
+  const quickColorOptions = threadSwatchColors.slice(0, 14);
 
   const notify = useCallback((message: string, tone: NoticeTone = "info") => {
     setNotice({ id: Date.now(), message, tone });
   }, []);
+
+  const clearPatternPreviewState = useCallback(() => {
+    patternWorkerRef.current?.terminate();
+    patternWorkerRef.current = null;
+    setPatternDraft(null);
+    setPatternJob({ status: "idle" });
+    setReplaceConfirmed(false);
+  }, []);
+
+  const selectReferenceImage = useCallback(
+    (id: string | null) => {
+      if (id === activeReferenceImageId) {
+        return;
+      }
+
+      setActiveReferenceImageId(id);
+      clearPatternPreviewState();
+      if (id && tool === "stitch") {
+        setTool("image");
+      }
+    },
+    [activeReferenceImageId, clearPatternPreviewState, tool],
+  );
+
+  const updateActiveReferenceImage = useCallback(
+    (update: (image: ReferenceImageState) => ReferenceImageState) => {
+      setReferenceImages((current) =>
+        updateReferenceImage(current, resolvedActiveReferenceImageId, update),
+      );
+      setPatternDraft(null);
+      setReplaceConfirmed(false);
+    },
+    [resolvedActiveReferenceImageId],
+  );
+
+  const clearReferenceImageCollection = useCallback(() => {
+    patternWorkerRef.current?.terminate();
+    patternWorkerRef.current = null;
+    referenceElementMapRef.current.clear();
+    setReferenceImages([]);
+    setActiveReferenceImageId(null);
+    setPatternDraft(null);
+    setPatternJob({ status: "idle" });
+    setReplaceConfirmed(false);
+    if (tool === "image" || tool === "eyedropper") setTool("stitch");
+  }, [tool]);
 
   const handleColorwayPreview = useCallback(
     (assignments: Record<string, string> | null) => {
@@ -2342,47 +2410,63 @@ export default function NeedlepointEditor() {
   }, []);
 
   useEffect(() => {
-    if (!referenceSrc) {
-      referenceElementRef.current = null;
-      return;
+    const elementMap = referenceElementMapRef.current;
+    const currentIds = new Set(referenceImages.map((image) => image.id));
+
+    for (const id of elementMap.keys()) {
+      if (!currentIds.has(id)) {
+        elementMap.delete(id);
+      }
     }
 
     let isActive = true;
-    const image = new Image();
 
-    image.onload = () => {
-      if (!isActive) {
-        return;
+    for (const reference of referenceImages) {
+      if (elementMap.has(reference.id)) {
+        continue;
       }
 
-      referenceElementRef.current = image;
-      setReferenceImage((current) =>
-        current?.src === referenceSrc
-          ? {
-              ...current,
-              width: image.naturalWidth,
-              height: image.naturalHeight,
-            }
-          : current,
-      );
-    };
+      const image = new Image();
 
-    image.onerror = () => {
-      if (!isActive) {
-        return;
-      }
+      image.onload = () => {
+        if (!isActive) {
+          return;
+        }
 
-      referenceElementRef.current = null;
-      setReferenceImage(null);
-      notify("Could not load that reference image.", "warn");
-    };
+        elementMap.set(reference.id, image);
+        setReferenceImages((current) =>
+          updateReferenceImage(current, reference.id, (state) => ({
+            ...state,
+            width: image.naturalWidth,
+            height: image.naturalHeight,
+          })),
+        );
+      };
 
-    image.src = referenceSrc;
+      image.onerror = () => {
+        if (!isActive) {
+          return;
+        }
+
+        elementMap.delete(reference.id);
+        setReferenceImages((current) =>
+          current.filter((imageState) => imageState.id !== reference.id),
+        );
+        setActiveReferenceImageId((current) =>
+          current === reference.id
+            ? nextActiveReferenceImageIdAfterRemoval(referenceImages, reference.id)
+            : current,
+        );
+        notify(`Could not load ${reference.name}.`, "warn");
+      };
+
+      image.src = reference.src;
+    }
 
     return () => {
       isActive = false;
     };
-  }, [notify, referenceSrc]);
+  }, [notify, referenceImages]);
 
   useEffect(() => {
     const stage = stageRef.current;
@@ -2427,20 +2511,16 @@ export default function NeedlepointEditor() {
 
     ctx.save();
     applyViewTransform(ctx, view, project.canvas);
-    drawCachedPerforatedSheet(
-      ctx,
-      project,
-      referenceElementRef.current &&
-        referenceImage &&
-        previewMode !== "pattern"
-        ? {
-            image: referenceElementRef.current,
-            state: referenceImage,
-          }
-        : null,
-    );
+    const renderedReferences =
+      previewMode !== "pattern"
+        ? referenceImages.flatMap((state) => {
+            const image = referenceElementMapRef.current.get(state.id);
+            return image ? [{ image, state }] : [];
+          })
+        : [];
+    drawCachedPerforatedSheet(ctx, project, renderedReferences);
     ctx.restore();
-  }, [patternDraft, previewMode, project, referenceImage, stageRenderScale, view, viewport]);
+  }, [patternDraft, previewMode, project, referenceImages, stageRenderScale, view, viewport]);
 
   useEffect(() => {
     const ctx = prepareCanvas(stitchCanvasRef.current, viewport, stageRenderScale);
@@ -2730,21 +2810,15 @@ export default function NeedlepointEditor() {
       y: focalPoint.y + (startCenter.y - focalPoint.y) * scaleRatio,
     };
 
-    setReferenceImage((current) =>
-      current
-        ? {
-            ...current,
-            transform: {
-              ...current.transform,
-              scale: nextScale,
-              translateX: (nextCenter.x - boundsCenter.x) / bounds.width,
-              translateY: (nextCenter.y - boundsCenter.y) / bounds.height,
-            },
-          }
-        : current,
-    );
-    setPatternDraft(null);
-    setReplaceConfirmed(false);
+    updateActiveReferenceImage((current) => ({
+      ...current,
+      transform: {
+        ...current.transform,
+        scale: nextScale,
+        translateX: (nextCenter.x - boundsCenter.x) / bounds.width,
+        translateY: (nextCenter.y - boundsCenter.y) / bounds.height,
+      },
+    }));
   };
 
   const updateStageGesture = () => {
@@ -2876,7 +2950,9 @@ export default function NeedlepointEditor() {
     }
 
     if (tool === "eyedropper") {
-      const image = referenceElementRef.current;
+      const image = resolvedActiveReferenceImageId
+        ? referenceElementMapRef.current.get(resolvedActiveReferenceImageId)
+        : null;
       if (!referenceImage || !image) {
         notify("Upload an image before choosing its background.", "warn");
         return;
@@ -2974,22 +3050,18 @@ export default function NeedlepointEditor() {
 
     if (imageDrag && imageDrag.pointerId === event.pointerId && referenceImage) {
       const bounds = getPatternBounds(project.canvas);
-      setReferenceImage((current) =>
-        current
-          ? {
-              ...current,
-              transform: {
-                ...current.transform,
-                translateX:
-                  imageDrag.origin.x +
-                  (worldPoint.x - imageDrag.startWorld.x) / bounds.width,
-                translateY:
-                  imageDrag.origin.y +
-                  (worldPoint.y - imageDrag.startWorld.y) / bounds.height,
-              },
-            }
-          : current,
-      );
+      updateActiveReferenceImage((current) => ({
+        ...current,
+        transform: {
+          ...current.transform,
+          translateX:
+            imageDrag.origin.x +
+            (worldPoint.x - imageDrag.startWorld.x) / bounds.width,
+          translateY:
+            imageDrag.origin.y +
+            (worldPoint.y - imageDrag.startWorld.y) / bounds.height,
+        },
+      }));
       return;
     }
 
@@ -3103,23 +3175,17 @@ export default function NeedlepointEditor() {
 
     if (tool === "image" && referenceImage) {
       const factor = event.deltaY > 0 ? 0.92 : 1.08;
-      setPatternDraft(null);
-      setReplaceConfirmed(false);
-      setReferenceImage((current) =>
-        current
-          ? {
-              ...current,
-              transform: {
-                ...current.transform,
-                scale: clamp(
-                  current.transform.scale * factor,
-                  REFERENCE_MIN_SCALE,
-                  REFERENCE_MAX_SCALE,
-                ),
-              },
-            }
-          : current,
-      );
+      updateActiveReferenceImage((current) => ({
+        ...current,
+        transform: {
+          ...current.transform,
+          scale: clamp(
+            current.transform.scale * factor,
+            REFERENCE_MIN_SCALE,
+            REFERENCE_MAX_SCALE,
+          ),
+        },
+      }));
       return;
     }
 
@@ -3130,7 +3196,7 @@ export default function NeedlepointEditor() {
     }
 
     zoomAt(screenPoint, event.deltaY > 0 ? 0.9 : 1.1);
-  }, [referenceImage, tool, zoomAt]);
+  }, [referenceImage, tool, updateActiveReferenceImage, zoomAt]);
 
   useEffect(() => {
     const stage = stageRef.current;
@@ -3181,9 +3247,9 @@ export default function NeedlepointEditor() {
     const nextProject = makeDefaultProject();
 
     closeColorwayStudio();
+    clearReferenceImageCollection();
     commitProject(nextProject);
-    setPatternDraft(null);
-    setReplaceConfirmed(false);
+    setShowResetConfirm(false);
     setSelectedColorId(INITIAL_SELECTED_COLOR_ID);
     setStrandCount(DEFAULT_STRAND_COUNT);
     fitViewToCanvas(nextProject.canvas);
@@ -3196,13 +3262,7 @@ export default function NeedlepointEditor() {
         localWorkspaceRef.current = { project, rotation: viewRef.current.rotation };
       }
       const nextProject = normalizeProject(shared.project);
-      patternWorkerRef.current?.terminate();
-      patternWorkerRef.current = null;
-      referenceElementRef.current = null;
-      setReferenceImage(null);
-      setPatternDraft(null);
-      setPatternJob({ status: "idle" });
-      setReplaceConfirmed(false);
+      clearReferenceImageCollection();
       setColorwayPreview(null);
       setInitialColorwayRoleId(undefined);
       setRightPanelMode("inspector");
@@ -3213,7 +3273,7 @@ export default function NeedlepointEditor() {
       const firstUsedColor = getUsedResolvedColors(nextProject)[0]?.color.id;
       if (firstUsedColor) setSelectedColorId(firstUsedColor);
     },
-    [project, sharedProjectSource, updateView],
+    [clearReferenceImageCollection, project, sharedProjectSource, updateView],
   );
 
   const saveSharedProjectLocally = () => {
@@ -3235,8 +3295,7 @@ export default function NeedlepointEditor() {
     };
     dispatch({ type: "hydrate", project: local.project });
     setSharedProjectSource(null);
-    setPatternDraft(null);
-    setReplaceConfirmed(false);
+    clearReferenceImageCollection();
     setColorwayPreview(null);
     setInitialColorwayRoleId(undefined);
     setRightPanelMode("inspector");
@@ -3246,7 +3305,7 @@ export default function NeedlepointEditor() {
     const firstUsedColor = getUsedResolvedColors(local.project)[0]?.color.id;
     if (firstUsedColor) setSelectedColorId(firstUsedColor);
     notify("Returned to the locally saved project.", "info");
-  }, [notify, updateView]);
+  }, [clearReferenceImageCollection, notify, updateView]);
 
   useEffect(() => {
     if (!state.hydrated) return;
@@ -3329,101 +3388,126 @@ export default function NeedlepointEditor() {
     }));
   };
 
-  const handleReferenceUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.currentTarget.files?.[0];
+  const handleReferenceUpload = async (
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const files = Array.from(event.currentTarget.files ?? []);
     event.currentTarget.value = "";
 
-    if (!file) {
+    if (files.length === 0) {
       return;
     }
 
-    if (!file.type.startsWith("image/")) {
+    const imageFiles = files.filter((file) => file.type.startsWith("image/"));
+
+    if (imageFiles.length === 0) {
       notify("Choose an image file.", "warn");
       return;
     }
 
-    const reader = new FileReader();
+    if (imageFiles.length < files.length) {
+      notify("Only image files were added.", "warn");
+    }
 
-    reader.onload = () => {
-      if (typeof reader.result !== "string") {
-        notify("Could not read that reference image.", "warn");
-        return;
-      }
+    const loadedImages = (
+      await Promise.allSettled(
+        imageFiles.map(
+          (file) =>
+            new Promise<ReferenceImageState>((resolve, reject) => {
+              const reader = new FileReader();
 
-      referenceElementRef.current = null;
-      setReferenceImage({
-        src: reader.result,
-        name: file.name,
-        opacity: 0.42,
-        width: null,
-        height: null,
-        fit: "fill",
-        transform: {
-          scale: 1,
-          translateX: 0,
-          translateY: 0,
-          rotation: 0,
-        },
-      });
-      setPatternDraft(null);
-      setReplaceConfirmed(false);
-      setPreviewMode("both");
-      setTool("image");
-      notify("Reference image loaded.", "success");
-    };
+              reader.onload = () => {
+                if (typeof reader.result !== "string") {
+                  reject(new Error("Invalid image data"));
+                  return;
+                }
 
-    reader.onerror = () => {
-      notify("Could not read that reference image.", "warn");
-    };
+                resolve(
+                  makeReferenceImageState({
+                    id: uniqueEntityId("image"),
+                    src: reader.result,
+                    name: file.name,
+                  }),
+                );
+              };
+              reader.onerror = () => reject(new Error("Could not read image"));
+              reader.readAsDataURL(file);
+            }),
+        ),
+      )
+    ).flatMap((result) => (result.status === "fulfilled" ? [result.value] : []));
 
-    reader.readAsDataURL(file);
+    if (loadedImages.length === 0) {
+      notify("Could not read those reference images.", "warn");
+      return;
+    }
+
+    const newest = loadedImages[loadedImages.length - 1];
+    setReferenceImages((current) => [...current, ...loadedImages]);
+    setActiveReferenceImageId(newest.id);
+    clearPatternPreviewState();
+    setPreviewMode("both");
+    setTool("image");
+    notify(
+      loadedImages.length === 1
+        ? "Reference image added."
+        : `${loadedImages.length} reference images added.`,
+      "success",
+    );
+  };
+
+  const removeReferenceImage = (id: string) => {
+    const target = referenceImages.find((image) => image.id === id);
+
+    if (!target) {
+      return;
+    }
+
+    const isRemovingActive = id === resolvedActiveReferenceImageId;
+    const nextActiveId = isRemovingActive
+      ? nextActiveReferenceImageIdAfterRemoval(referenceImages, id)
+      : resolvedActiveReferenceImageId;
+
+    referenceElementMapRef.current.delete(id);
+    setReferenceImages((current) => current.filter((image) => image.id !== id));
+    setActiveReferenceImageId(nextActiveId);
+    if (isRemovingActive) {
+      clearPatternPreviewState();
+    }
+    if (!nextActiveId && (tool === "image" || tool === "eyedropper")) {
+      setTool("stitch");
+    }
+    notify("Reference image removed.", "info");
   };
 
   const clearReferenceImage = () => {
-    patternWorkerRef.current?.terminate();
-    patternWorkerRef.current = null;
-    referenceElementRef.current = null;
-    setReferenceImage(null);
-    setPatternDraft(null);
-    setPatternJob({ status: "idle" });
-    setReplaceConfirmed(false);
-    if (tool === "image" || tool === "eyedropper") setTool("stitch");
-    notify("Reference image cleared.", "info");
+    if (referenceImage) {
+      removeReferenceImage(referenceImage.id);
+    }
   };
 
   const resetReferenceFrame = (fit: "fit" | "fill") => {
-    setReferenceImage((current) =>
-      current
-        ? {
-            ...current,
-            fit,
-            transform: {
-              ...current.transform,
-              scale: 1,
-              translateX: 0,
-              translateY: 0,
-            },
-          }
-        : current,
-    );
-    setPatternDraft(null);
-    setReplaceConfirmed(false);
+    updateActiveReferenceImage((current) => ({
+      ...current,
+      fit,
+      transform: {
+        ...current.transform,
+        scale: 1,
+        translateX: 0,
+        translateY: 0,
+      },
+    }));
   };
 
   const rotateReference = () => {
-    setReferenceImage((current) =>
-      current
-        ? {
-            ...current,
-            transform: {
-              ...current.transform,
-              rotation: ((current.transform.rotation + 90) % 360) as ReferenceTransform["rotation"],
-            },
-          }
-        : current,
-    );
-    setPatternDraft(null);
-    setReplaceConfirmed(false);
+    updateActiveReferenceImage((current) => ({
+      ...current,
+      transform: {
+        ...current.transform,
+        rotation: ((current.transform.rotation + 90) %
+          360) as ReferenceTransform["rotation"],
+      },
+    }));
   };
 
   const cancelPatternPreview = () => {
@@ -3434,7 +3518,9 @@ export default function NeedlepointEditor() {
   };
 
   const generatePatternPreview = () => {
-    const image = referenceElementRef.current;
+    const image = resolvedActiveReferenceImageId
+      ? referenceElementMapRef.current.get(resolvedActiveReferenceImageId)
+      : null;
     if (!referenceImage || !image) {
       notify("Upload and load an image first.", "warn");
       return;
@@ -3548,6 +3634,7 @@ export default function NeedlepointEditor() {
   };
 
   const cancelPdfExport = () => {
+    pdfExportIdRef.current += 1;
     pdfWorkerRef.current?.terminate();
     pdfWorkerRef.current = null;
     setPdfJob({ status: "idle" });
@@ -3564,7 +3651,12 @@ export default function NeedlepointEditor() {
       status: "working",
       progress: { stage: "preparing", percent: 2 },
     });
+    const exportId = pdfExportIdRef.current + 1;
+    pdfExportIdRef.current = exportId;
     const previewPng = await createPdfPreviewPng(project);
+    if (pdfExportIdRef.current !== exportId) {
+      return;
+    }
     const worker = new Worker(new URL("../_workers/patternPdf.worker.ts", import.meta.url), {
       type: "module",
     });
@@ -3577,6 +3669,11 @@ export default function NeedlepointEditor() {
         | { type: "error"; message: string }
       >,
     ) => {
+      if (pdfExportIdRef.current !== exportId) {
+        worker.terminate();
+        return;
+      }
+
       if (event.data.type === "progress") {
         setPdfJob({ status: "working", progress: event.data.progress });
         return;
@@ -3597,6 +3694,11 @@ export default function NeedlepointEditor() {
     };
 
     worker.onerror = () => {
+      if (pdfExportIdRef.current !== exportId) {
+        worker.terminate();
+        return;
+      }
+
       worker.terminate();
       if (pdfWorkerRef.current === worker) pdfWorkerRef.current = null;
       setPdfJob({ status: "error", message: "PDF export failed." });
@@ -3744,43 +3846,31 @@ export default function NeedlepointEditor() {
             <Share2 size={18} strokeWidth={1.8} />
           </IconButton>
           <IconButton label="Export PNG" disabled={exporting} onClick={exportPng}>
-            <Download size={18} strokeWidth={1.8} />
+            {exporting ? (
+              <LoaderCircle size={18} strokeWidth={1.8} className="animate-spin" />
+            ) : (
+              <Download size={18} strokeWidth={1.8} />
+            )}
           </IconButton>
           <IconButton
             label="Export printable pattern PDF"
-            disabled={pdfJob.status === "working" || project.stitches.length === 0}
+            disabled={isPdfExporting || project.stitches.length === 0}
             onClick={exportPatternPdf}
           >
-            <FileText size={18} strokeWidth={1.8} />
+            {isPdfExporting ? (
+              <LoaderCircle size={18} strokeWidth={1.8} className="animate-spin" />
+            ) : (
+              <FileText size={18} strokeWidth={1.8} />
+            )}
           </IconButton>
-          <IconButton label="Reset sheet" onClick={resetProject}>
-            <RotateCcw size={18} strokeWidth={1.8} />
+          <IconButton label="Reset sheet" onClick={() => setShowResetConfirm(true)}>
+            <Trash2 size={18} strokeWidth={1.8} />
           </IconButton>
             </>
           )}
         </aside>
 
         <section className={stagePanelClass}>
-          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#dec9b1] px-4 py-3">
-            <div className="min-w-0">
-              <h1 className="text-xl font-semibold tracking-tight text-[#332419]">
-                Needler
-              </h1>
-              <p className="text-sm text-[#765943]">
-                {physicalWidth} x {physicalHeight} in, {meshCount}-count
-                perforated paper
-              </p>
-            </div>
-            <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-[0.08em] text-[#765943]">
-              <span className="h-2 w-2 rounded-full bg-[#6f8d62]" />
-              {state.hydrated
-                ? sharedProjectSource
-                  ? "Temporary copy"
-                  : "Saved locally"
-                : "Loading"}
-            </div>
-          </div>
-
           {sharedProjectSource ? (
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#dec9b1] bg-[#f4e4d1] px-4 py-2.5">
               <div className="flex min-w-0 items-center gap-2 text-sm font-medium text-[#4f392b]">
@@ -3840,6 +3930,97 @@ export default function NeedlepointEditor() {
             <canvas ref={baseCanvasRef} className="absolute inset-0" />
             <canvas ref={stitchCanvasRef} className="absolute inset-0" />
             <canvas ref={previewCanvasRef} className="absolute inset-0" />
+            <div
+              className="pointer-events-auto absolute w-[min(224px,calc(100%-1.5rem))]"
+              style={{
+                right: "max(0.75rem, env(safe-area-inset-right))",
+                top: "max(4.9rem, calc(env(safe-area-inset-top) + 4.9rem))",
+              }}
+              onPointerDown={(event) => event.stopPropagation()}
+              onPointerMove={(event) => event.stopPropagation()}
+              onPointerUp={(event) => event.stopPropagation()}
+              onPointerCancel={(event) => event.stopPropagation()}
+              onWheel={(event) => event.stopPropagation()}
+            >
+              {quickColorCollapsed ? (
+                <button
+                  type="button"
+                  aria-label="Show thread colors"
+                  title="Show thread colors"
+                  className="ml-auto flex h-11 w-11 items-center justify-center rounded-md border border-[#d8c4ad] bg-[#fff8ef]/92 p-1.5 shadow-[0_12px_30px_-24px_rgba(58,35,22,0.5)] transition active:translate-y-px"
+                  onClick={() => setQuickColorCollapsed(false)}
+                >
+                  <span
+                    className="h-full w-full rounded border border-[#cdb39a]"
+                    style={{ backgroundColor: activePreviewColor }}
+                  />
+                </button>
+              ) : (
+                <div className="rounded-md border border-[#d6bfa6] bg-[#fff8ef]/94 p-2 shadow-[0_18px_36px_-26px_rgba(58,35,22,0.55)]">
+                  <div className="flex items-center justify-between gap-2">
+                    <button
+                      type="button"
+                      className="flex min-w-0 items-center gap-2 text-left"
+                      onClick={() => {
+                        setPanelCollapsed(false);
+                        setRightPanelMode("inspector");
+                      }}
+                    >
+                      <span
+                        className="h-8 w-8 shrink-0 rounded border border-[#cdb39a]"
+                        style={{ backgroundColor: activePreviewColor }}
+                      />
+                      <span className="min-w-0">
+                        <span className="block truncate text-xs font-semibold uppercase tracking-[0.08em] text-[#765943]">
+                          Thread
+                        </span>
+                        <span className="block truncate text-xs text-[#4f392b]">
+                          {selectedColor ? getPaletteLabel(selectedColor) : "Select color"}
+                        </span>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Collapse thread colors"
+                      title="Collapse thread colors"
+                      className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-[#d8c4ad] bg-white text-[#654a38] transition active:translate-y-px"
+                      onClick={() => setQuickColorCollapsed(true)}
+                    >
+                      <PanelRightClose size={15} strokeWidth={1.8} />
+                    </button>
+                  </div>
+                  <div className="mt-2 grid grid-cols-7 gap-1">
+                    {quickColorOptions.map((color) => (
+                      <button
+                        key={color.id}
+                        type="button"
+                        aria-label={`Select ${getPaletteLabel(color)}`}
+                        title={getPaletteLabel(color)}
+                        className={[
+                          "h-6 rounded border transition active:translate-y-px",
+                          selectedColorId === color.id
+                            ? "border-[#38271d] ring-2 ring-[#7e4e36]/25"
+                            : "border-[#d6bfa6] hover:border-[#9d8064]",
+                        ].join(" ")}
+                        style={{ backgroundColor: color.hex }}
+                        onClick={() => setSelectedColorId(color.id)}
+                      />
+                    ))}
+                  </div>
+                  <button
+                    type="button"
+                    className="mt-2 flex h-8 w-full items-center justify-center gap-1.5 rounded-md border border-[#d8c4ad] bg-white px-2 text-xs font-medium text-[#4f392b] transition hover:border-[#b99b7d] active:translate-y-px"
+                    onClick={() => {
+                      setPanelCollapsed(false);
+                      setRightPanelMode("inspector");
+                    }}
+                  >
+                    <Palette size={14} strokeWidth={1.8} />
+                    Manage colors
+                  </button>
+                </div>
+              )}
+            </div>
             {patternJob.status === "working" ? (
               <div
                 className="pointer-events-none absolute left-1/2 w-[min(320px,calc(100%-24px))] -translate-x-1/2 rounded-md border border-[#d6bfa6] bg-[#fff8ef]/94 px-3 py-3 shadow-[0_14px_28px_-22px_rgba(58,35,22,0.5)]"
@@ -3895,6 +4076,16 @@ export default function NeedlepointEditor() {
             >
               <span>{Math.round(view.zoom * 100)}%</span>
               <span>{Math.round(view.rotation)} deg</span>
+            </div>
+            <div
+              className="pointer-events-none absolute flex items-center gap-2 rounded-md border border-[#e2cbb2] bg-[#fff8ef]/88 px-3 py-2 text-xs font-medium uppercase tracking-[0.08em] text-[#765943] shadow-[0_12px_30px_-24px_rgba(58,35,22,0.42)]"
+              style={{
+                bottom: "max(0.75rem, env(safe-area-inset-bottom))",
+                right: "max(0.75rem, env(safe-area-inset-right))",
+              }}
+            >
+              <span className="h-2 w-2 rounded-full bg-[#6f8d62]" />
+              {editorStatusLabel}
             </div>
           </div>
         </section>
@@ -4118,14 +4309,66 @@ export default function NeedlepointEditor() {
             <div className="mt-3 grid gap-3">
               <label className={`${panelButtonClass()} cursor-pointer`}>
                 <ImagePlus size={16} strokeWidth={1.8} />
-                {referenceImage ? "Replace image" : "Upload image"}
+                {referenceImages.length > 0 ? "Add images" : "Upload images"}
                 <input
                   type="file"
                   accept="image/*"
+                  multiple
                   className="sr-only"
                   onChange={handleReferenceUpload}
                 />
               </label>
+              {referenceImages.length > 0 ? (
+                <div className="grid gap-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-medium uppercase tracking-[0.08em] text-[#765943]">
+                      Reference images
+                    </span>
+                    <span className="font-mono text-[10px] uppercase text-[#8a6c55]">
+                      {referenceImages.length} local
+                    </span>
+                  </div>
+                  <div className="grid max-h-36 gap-1 overflow-y-auto pr-1">
+                    {referenceImages.map((imageState) => {
+                      const isActive = imageState.id === resolvedActiveReferenceImageId;
+
+                      return (
+                        <div
+                          key={imageState.id}
+                          className={[
+                            "grid grid-cols-[minmax(0,1fr)_32px] items-stretch overflow-hidden rounded-md border bg-white/70",
+                            isActive ? "border-[#7e4e36]" : "border-[#e4d2bf]",
+                          ].join(" ")}
+                        >
+                          <button
+                            type="button"
+                            className="min-w-0 px-2 py-1.5 text-left transition hover:bg-white"
+                            onClick={() => selectReferenceImage(imageState.id)}
+                          >
+                            <span className="block truncate text-xs font-medium text-[#3d2b1f]">
+                              {imageState.name}
+                            </span>
+                            <span className="block font-mono text-[10px] text-[#8a6c55]">
+                              {imageState.width && imageState.height
+                                ? `${imageState.width} x ${imageState.height}`
+                                : "Loading"}
+                            </span>
+                          </button>
+                          <button
+                            type="button"
+                            aria-label={`Remove ${imageState.name}`}
+                            title="Remove image"
+                            className="flex items-center justify-center border-l border-[#ead9c7] text-[#765943] transition hover:bg-[#fff2df] hover:text-[#8a332c]"
+                            onClick={() => removeReferenceImage(imageState.id)}
+                          >
+                            <X size={14} strokeWidth={1.8} />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
               {referenceImage ? (
                 <>
                   <div className="rounded-md border border-[#e4d2bf] bg-white/70 px-3 py-2">
@@ -4179,21 +4422,15 @@ export default function NeedlepointEditor() {
                       step="0.01"
                       value={referenceImage.transform.scale}
                       className="accent-[#7e4e36]"
-                      onChange={(event) => {
-                        setReferenceImage((current) =>
-                          current
-                            ? {
-                                ...current,
-                                transform: {
-                                  ...current.transform,
-                                  scale: Number(event.target.value),
-                                },
-                              }
-                            : current,
-                        );
-                        setPatternDraft(null);
-                        setReplaceConfirmed(false);
-                      }}
+                      onChange={(event) =>
+                        updateActiveReferenceImage((current) => ({
+                          ...current,
+                          transform: {
+                            ...current.transform,
+                            scale: Number(event.target.value),
+                          },
+                        }))
+                      }
                     />
                     <span className="font-mono text-xs font-normal text-[#8a6c55]">
                       {Math.round(referenceImage.transform.scale * 100)}%
@@ -4209,14 +4446,10 @@ export default function NeedlepointEditor() {
                       value={referenceImage.opacity}
                       className="accent-[#7e4e36]"
                       onChange={(event) =>
-                        setReferenceImage((current) =>
-                          current
-                            ? {
-                                ...current,
-                                opacity: Number(event.target.value),
-                              }
-                            : current,
-                        )
+                        updateActiveReferenceImage((current) => ({
+                          ...current,
+                          opacity: Number(event.target.value),
+                        }))
                       }
                     />
                   </label>
@@ -4227,7 +4460,7 @@ export default function NeedlepointEditor() {
                       onClick={clearReferenceImage}
                     >
                       <ImageOff size={16} strokeWidth={1.8} />
-                      Clear
+                      Remove
                     </button>
                     <button
                       type="button"
@@ -4445,14 +4678,22 @@ export default function NeedlepointEditor() {
                         <button
                           type="button"
                           className={panelButtonClass("solid")}
-                          onClick={() => commitPatternDraft("replace")}
+                          onClick={() => commitPatternDraft("fill")}
                         >
                           <Check size={16} strokeWidth={1.8} />
-                          Apply pattern
+                          Add to sheet
                         </button>
                       ) : (
                         <div className="grid gap-2">
                           <div className="grid grid-cols-2 gap-2">
+                            <button
+                              type="button"
+                              className={panelButtonClass("solid")}
+                              onClick={() => commitPatternDraft("fill")}
+                            >
+                              <Plus size={16} strokeWidth={1.8} />
+                              Add empty
+                            </button>
                             <button
                               type="button"
                               className={panelButtonClass(replaceConfirmed ? "solid" : "quiet")}
@@ -4464,14 +4705,6 @@ export default function NeedlepointEditor() {
                                 <Layers3 size={16} strokeWidth={1.8} />
                               )}
                               {replaceConfirmed ? "Confirm" : "Replace"}
-                            </button>
-                            <button
-                              type="button"
-                              className={panelButtonClass("solid")}
-                              onClick={() => commitPatternDraft("fill")}
-                            >
-                              <Plus size={16} strokeWidth={1.8} />
-                              Fill empty
                             </button>
                           </div>
                           {replaceConfirmed ? (
@@ -4655,11 +4888,19 @@ export default function NeedlepointEditor() {
                 disabled={exporting}
                 onClick={exportPng}
               >
-                <Download size={16} strokeWidth={1.8} />
+                {exporting ? (
+                  <LoaderCircle size={16} strokeWidth={1.8} className="animate-spin" />
+                ) : (
+                  <Download size={16} strokeWidth={1.8} />
+                )}
                 {exporting ? "Exporting" : "PNG"}
               </button>
-              <button type="button" className={panelButtonClass()} onClick={resetProject}>
-                <RotateCcw size={16} strokeWidth={1.8} />
+              <button
+                type="button"
+                className={panelButtonClass()}
+                onClick={() => setShowResetConfirm(true)}
+              >
+                <Trash2 size={16} strokeWidth={1.8} />
                 Reset
               </button>
             </div>
@@ -4674,7 +4915,10 @@ export default function NeedlepointEditor() {
             {pdfJob.status === "working" ? (
               <div className="mt-2 grid gap-2 rounded-md border border-[#d6bfa6] bg-[#f8efe3] px-3 py-3">
                 <div className="flex items-center justify-between gap-3 text-xs font-medium uppercase tracking-[0.08em] text-[#765943]">
-                  <span>{pdfJob.progress.stage}</span>
+                  <span className="inline-flex items-center gap-2">
+                    <LoaderCircle size={14} strokeWidth={1.8} className="animate-spin" />
+                    {pdfJob.progress.stage}
+                  </span>
                   <span className="font-mono">{pdfJob.progress.percent}%</span>
                 </div>
                 <div className="h-1.5 overflow-hidden rounded-full bg-[#e2d0bd]">
@@ -4696,11 +4940,15 @@ export default function NeedlepointEditor() {
               <button
                 type="button"
                 className={`${panelButtonClass("solid")} mt-2 w-full`}
-                disabled={project.stitches.length === 0}
+                disabled={isPdfExporting || project.stitches.length === 0}
                 onClick={exportPatternPdf}
               >
-                <FileText size={16} strokeWidth={1.8} />
-                Printable pattern PDF
+                {isPdfExporting ? (
+                  <LoaderCircle size={16} strokeWidth={1.8} className="animate-spin" />
+                ) : (
+                  <FileText size={16} strokeWidth={1.8} />
+                )}
+                {isPdfExporting ? "Preparing PDF" : "Printable pattern PDF"}
               </button>
             )}
             {pdfJob.status === "error" ? (
@@ -4730,6 +4978,56 @@ export default function NeedlepointEditor() {
         </aside>
         )}
       </div>
+      {showResetConfirm ? (
+        <div
+          className="fixed inset-0 z-30 grid place-items-center bg-[#38271d]/38 px-4 backdrop-blur-sm"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setShowResetConfirm(false);
+            }
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="reset-sheet-title"
+            className="w-full max-w-sm rounded-lg border border-[#d6bfa6] bg-[#fff8ef] p-4 text-[#38271d] shadow-[0_28px_60px_-36px_rgba(56,39,29,0.6)]"
+          >
+            <div className="flex items-start gap-3">
+              <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-[#cfa098] bg-[#fff3ef] text-[#8a332c]">
+                <Trash2 size={19} strokeWidth={1.8} />
+              </span>
+              <div className="min-w-0">
+                <h2 id="reset-sheet-title" className="text-base font-semibold">
+                  Reset sheet?
+                </h2>
+                <p className="mt-1 text-sm leading-5 text-[#765943]">
+                  This clears the current sheet and local reference images. Undo
+                  remains available for the stitch project reset.
+                </p>
+              </div>
+            </div>
+            <div className="mt-4 grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                className={panelButtonClass()}
+                onClick={() => setShowResetConfirm(false)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-[#8a332c] bg-[#8a332c] px-3 text-sm font-medium text-[#fffaf3] transition hover:bg-[#743026] active:translate-y-px"
+                onClick={resetProject}
+              >
+                <Trash2 size={16} strokeWidth={1.8} />
+                Reset
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 }
