@@ -9,6 +9,14 @@ export type Stitch = {
   strands?: number;
 };
 
+export type StitchLayer = {
+  id: string;
+  name: string;
+  visible: boolean;
+  locked: boolean;
+  stitches: Stitch[];
+};
+
 export type PaletteColor = {
   id: string;
   name: string;
@@ -45,10 +53,11 @@ export type ProjectColorState = {
 };
 
 export type Project = {
-  version: 2;
+  version: 3;
   canvas: SheetCanvas;
   palette: PaletteColor[];
-  stitches: Stitch[];
+  layers: StitchLayer[];
+  activeLayerId: string;
   colors: ProjectColorState;
 };
 

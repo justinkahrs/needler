@@ -9,12 +9,19 @@ import type {
   Stitch,
 } from "@/app/_lib/needlepointTypes";
 import { deserializeProject } from "@/app/_lib/persistence";
+import {
+  getAllStitches,
+  getVisibleStitches,
+  validateVisibleComposite,
+} from "@/app/_lib/layers";
 
-export const SHARE_HASH_PREFIX = "#share=v1.";
+export const SHARE_HASH_PREFIX = "#share=v2.";
+const LEGACY_SHARE_HASH_PREFIX = "#share=v1.";
 export const PRACTICAL_SHARE_URL_LIMIT = 48_000;
 export const NEEDLER_FILE_EXTENSION = ".needler";
 
-const SHARE_FORMAT_VERSION = 1 as const;
+const SHARE_FORMAT_VERSION = 2 as const;
+const LEGACY_SHARE_FORMAT_VERSION = 1 as const;
 const GRID_COLS = 126;
 const GRID_ROWS = 168;
 const GRID_CELL_COUNT = GRID_COLS * GRID_ROWS;
@@ -62,6 +69,26 @@ type CompactSharePayload = {
   e?: CompactStitch[];
   q?: number[];
   s?: CompactStitch[];
+};
+type CompactLayerPayload = {
+  i: string;
+  n: string;
+  v?: 0;
+  k?: 1;
+  m: "g" | "s";
+  t?: CompactGridStyle[];
+  g?: string;
+  e?: CompactStitch[];
+  q?: number[];
+  s?: CompactStitch[];
+};
+type CompactSharePayloadV2 = Omit<
+  CompactSharePayload,
+  "v" | "m" | "t" | "g" | "e" | "q" | "s"
+> & {
+  v: 2;
+  y?: number;
+  l: CompactLayerPayload[];
 };
 
 export type EncodedShareProject = {
@@ -274,12 +301,12 @@ async function gunzip(bytes: Uint8Array) {
 }
 
 function encodeDenseGrid(
-  project: Project,
+  stitches: Stitch[],
   roleIndex: Map<string, number>,
 ) {
-  if (project.stitches.length === 0) return null;
+  if (stitches.length === 0) return null;
 
-  const unitCells = project.stitches.map(unitStitchCell);
+  const unitCells = stitches.map(unitStitchCell);
   const cellCounts = new Map<number, number>();
   for (const unit of unitCells) {
     if (unit) cellCounts.set(unit.index, (cellCounts.get(unit.index) ?? 0) + 1);
@@ -291,8 +318,8 @@ function encodeDenseGrid(
   const exceptionPositions: number[] = [];
   let previousCell = -1;
 
-  for (let index = 0; index < project.stitches.length; index += 1) {
-    const stitch = project.stitches[index];
+  for (let index = 0; index < stitches.length; index += 1) {
+    const stitch = stitches[index];
     const unit = unitCells[index];
     const storedRole = roleIndex.get(stitch.colorRoleId);
     const strands = stitch.strands ?? 6;
@@ -333,7 +360,40 @@ function encodeDenseGrid(
     : null;
 }
 
-function makeCompactPayload(project: Project, rotation: number): CompactSharePayload {
+function encodeStitchPayload(stitches: Stitch[], roleIndex: Map<string, number>) {
+  const dense = encodeDenseGrid(stitches, roleIndex);
+
+  if (dense) {
+    return {
+      m: "g" as const,
+      t: dense.styles,
+      g: uint16ToBase64(dense.cells),
+      ...(dense.exceptions.length > 0
+        ? { e: dense.exceptions, q: dense.exceptionPositions }
+        : {}),
+    };
+  }
+
+  return {
+    m: "s" as const,
+    s: stitches.map((stitch) => {
+      const storedRole = roleIndex.get(stitch.colorRoleId);
+      if (storedRole === undefined) {
+        throw new ShareProjectError("A stitch references an unknown color role.");
+      }
+      return [
+        stitch.from.col,
+        stitch.from.row,
+        stitch.to.col,
+        stitch.to.row,
+        storedRole,
+        stitch.strands ?? 6,
+      ] as CompactStitch;
+    }),
+  };
+}
+
+function makeCompactPayload(project: Project, rotation: number): CompactSharePayloadV2 {
   validateSharedProject(project);
 
   const paletteIndex = new Map(
@@ -385,37 +445,20 @@ function makeCompactPayload(project: Project, rotation: number): CompactSharePay
       ? { z: normalizeRotation(rotation) }
       : {}),
   };
-  const dense = encodeDenseGrid(project, roleIndex);
-
-  if (dense) {
-    return {
-      ...common,
-      m: "g",
-      t: dense.styles,
-      g: uint16ToBase64(dense.cells),
-      ...(dense.exceptions.length > 0
-        ? { e: dense.exceptions, q: dense.exceptionPositions }
-        : {}),
-    };
-  }
+  const activeLayerIndex = project.layers.findIndex(
+    (layer) => layer.id === project.activeLayerId,
+  );
 
   return {
     ...common,
-    m: "s",
-    s: project.stitches.map((stitch) => {
-      const storedRole = roleIndex.get(stitch.colorRoleId);
-      if (storedRole === undefined) {
-        throw new ShareProjectError("A stitch references an unknown color role.");
-      }
-      return [
-        stitch.from.col,
-        stitch.from.row,
-        stitch.to.col,
-        stitch.to.row,
-        storedRole,
-        stitch.strands ?? 6,
-      ];
-    }),
+    l: project.layers.map((layer) => ({
+      i: layer.id,
+      n: layer.name,
+      ...(layer.visible ? {} : { v: 0 as const }),
+      ...(layer.locked ? { k: 1 as const } : {}),
+      ...encodeStitchPayload(layer.stitches, roleIndex),
+    })),
+    ...(activeLayerIndex >= 0 ? { y: activeLayerIndex } : {}),
   };
 }
 
@@ -572,41 +615,13 @@ function stitchFromGridCell(
   return [col + 1, row + 1, col, row, roleIndex, strands];
 }
 
-function decodeCompactPayload(value: unknown): DecodedShareProject {
-  if (!isRecord(value) || value.v !== SHARE_FORMAT_VERSION) {
-    throw new ShareProjectError("This Needler share format is not supported.");
-  }
-
-  const palette = decodePalette(value.p);
-  const roles = decodeRoles(value.r, palette.length);
-  const current = decodeAssignments(value.a, roles.length, palette.length);
-  if (!Array.isArray(value.w) || value.w.length > 100) {
-    throw new ShareProjectError("The shared project has invalid colorways.");
-  }
-  const colorwayIds = new Set<string>();
-  const colorways = value.w.map((entry) => {
-    if (
-      !Array.isArray(entry) ||
-      entry.length !== 3 ||
-      typeof entry[0] !== "string" ||
-      entry[0].length === 0 ||
-      entry[0].length > 160 ||
-      colorwayIds.has(entry[0]) ||
-      typeof entry[1] !== "string" ||
-      entry[1].length > 160
-    ) {
-      throw new ShareProjectError("The shared project has invalid colorways.");
-    }
-    colorwayIds.add(entry[0]);
-    return {
-      id: entry[0],
-      name: entry[1],
-      assignments: decodeAssignments(entry[2], roles.length, palette.length),
-    };
-  });
-
+function decodeStitchPayload(
+  value: Record<string, unknown>,
+  roleCount: number,
+): { stitches: CompactStitch[]; mode: DecodedShareProject["mode"] } {
   let stitches: CompactStitch[];
   let mode: DecodedShareProject["mode"];
+
   if (value.m === "g") {
     if (!Array.isArray(value.t) || value.t.length > 65_534 || typeof value.g !== "string") {
       throw new ShareProjectError("The shared project has an invalid stitch grid.");
@@ -617,7 +632,7 @@ function decodeCompactPayload(value: unknown): DecodedShareProject {
         style.length !== 3 ||
         !style.every(isInteger) ||
         style[0] < 0 ||
-        style[0] >= roles.length ||
+        style[0] >= roleCount ||
         style[1] < 1 ||
         style[1] > 8 ||
         style[2] < 0 ||
@@ -648,7 +663,7 @@ function decodeCompactPayload(value: unknown): DecodedShareProject {
         throw new ShareProjectError("The shared project has invalid stitch exceptions.");
       }
       const exceptions = value.e.map((entry) =>
-        decodeStitchTuple(entry, roles.length),
+        decodeStitchTuple(entry, roleCount),
       );
       const totalStitches = stitches.length + exceptions.length;
       let previousPosition = -1;
@@ -689,11 +704,50 @@ function decodeCompactPayload(value: unknown): DecodedShareProject {
     if (!Array.isArray(value.s) || value.s.length > 200_000) {
       throw new ShareProjectError("The shared project has an invalid stitch list.");
     }
-    stitches = value.s.map((stitch) => decodeStitchTuple(stitch, roles.length));
+    stitches = value.s.map((stitch) => decodeStitchTuple(stitch, roleCount));
     mode = "stitches";
   } else {
     throw new ShareProjectError("The shared project has an unknown stitch encoding.");
   }
+
+  return { stitches, mode };
+}
+
+function decodeCompactPayload(value: unknown): DecodedShareProject {
+  if (
+    !isRecord(value) ||
+    (value.v !== SHARE_FORMAT_VERSION && value.v !== LEGACY_SHARE_FORMAT_VERSION)
+  ) {
+    throw new ShareProjectError("This Needler share format is not supported.");
+  }
+
+  const palette = decodePalette(value.p);
+  const roles = decodeRoles(value.r, palette.length);
+  const current = decodeAssignments(value.a, roles.length, palette.length);
+  if (!Array.isArray(value.w) || value.w.length > 100) {
+    throw new ShareProjectError("The shared project has invalid colorways.");
+  }
+  const colorwayIds = new Set<string>();
+  const colorways = value.w.map((entry) => {
+    if (
+      !Array.isArray(entry) ||
+      entry.length !== 3 ||
+      typeof entry[0] !== "string" ||
+      entry[0].length === 0 ||
+      entry[0].length > 160 ||
+      colorwayIds.has(entry[0]) ||
+      typeof entry[1] !== "string" ||
+      entry[1].length > 160
+    ) {
+      throw new ShareProjectError("The shared project has invalid colorways.");
+    }
+    colorwayIds.add(entry[0]);
+    return {
+      id: entry[0],
+      name: entry[1],
+      assignments: decodeAssignments(entry[2], roles.length, palette.length),
+    };
+  });
 
   const activeIndex = value.x;
   if (
@@ -706,17 +760,93 @@ function decodeCompactPayload(value: unknown): DecodedShareProject {
     throw new ShareProjectError("The shared project has an invalid sheet rotation.");
   }
 
-  const storedProject = {
-    version: 3,
-    palette,
-    roles,
-    current,
-    colorways,
-    ...(activeIndex === undefined
-      ? {}
-      : { activeColorwayId: colorways[activeIndex].id }),
-    stitches,
-  };
+  let storedProject: unknown;
+  let mode: DecodedShareProject["mode"];
+
+  if (value.v === LEGACY_SHARE_FORMAT_VERSION) {
+    const decoded = decodeStitchPayload(value, roles.length);
+    mode = decoded.mode;
+    storedProject = {
+      version: 3,
+      palette,
+      roles,
+      current,
+      colorways,
+      ...(activeIndex === undefined
+        ? {}
+        : { activeColorwayId: colorways[activeIndex].id }),
+      stitches: decoded.stitches,
+    };
+  } else {
+    if (!Array.isArray(value.l) || value.l.length === 0 || value.l.length > 100) {
+      throw new ShareProjectError("The shared project has invalid layers.");
+    }
+    const layerIds = new Set<string>();
+    const decodedLayers = value.l.map((entry): {
+      id: string;
+      name: string;
+      visible: boolean;
+      locked: boolean;
+      stitches: CompactStitch[];
+      mode: DecodedShareProject["mode"];
+    } => {
+      if (
+        !isRecord(entry) ||
+        typeof entry.i !== "string" ||
+        entry.i.length === 0 ||
+        entry.i.length > 160 ||
+        layerIds.has(entry.i) ||
+        typeof entry.n !== "string" ||
+        entry.n.length === 0 ||
+        entry.n.length > 160 ||
+        (entry.v !== undefined && entry.v !== 0) ||
+        (entry.k !== undefined && entry.k !== 1)
+      ) {
+        throw new ShareProjectError("The shared project has invalid layers.");
+      }
+      layerIds.add(entry.i);
+      const decoded = decodeStitchPayload(entry, roles.length);
+      return {
+        id: entry.i,
+        name: entry.n,
+        visible: entry.v !== 0,
+        locked: entry.k === 1,
+        stitches: decoded.stitches,
+        mode: decoded.mode,
+      };
+    });
+    const activeLayerIndex = value.y;
+    if (
+      activeLayerIndex !== undefined &&
+      (!isInteger(activeLayerIndex) ||
+        activeLayerIndex < 0 ||
+        activeLayerIndex >= decodedLayers.length)
+    ) {
+      throw new ShareProjectError("The shared project has an invalid active layer.");
+    }
+    mode = decodedLayers.every((layer) => layer.mode === "grid") ? "grid" : "stitches";
+    storedProject = {
+      version: 4,
+      palette,
+      roles,
+      current,
+      colorways,
+      ...(activeIndex === undefined
+        ? {}
+        : { activeColorwayId: colorways[activeIndex].id }),
+      ...(activeLayerIndex === undefined
+        ? {}
+        : { activeLayerId: decodedLayers[activeLayerIndex].id }),
+      layers: decodedLayers.map((layer) => ({
+        id: layer.id,
+        name: layer.name,
+        visible: layer.visible,
+        locked: layer.locked,
+        stitches: layer.stitches,
+      })),
+    };
+  }
+
   const project = deserializeProject(storedProject);
   if (!project) {
     throw new ShareProjectError("The shared project could not be reconstructed.");
@@ -763,8 +893,28 @@ export function validateSharedProject(project: Project) {
     throw new ShareProjectError("The shared project has invalid color assignments.");
   }
 
+  if (
+    project.layers.length === 0 ||
+    !project.layers.some((layer) => layer.id === project.activeLayerId)
+  ) {
+    throw new ShareProjectError("The shared project has invalid layers.");
+  }
+  const layerIds = new Set<string>();
+  for (const layer of project.layers) {
+    if (
+      !layer.id ||
+      !layer.name ||
+      layerIds.has(layer.id) ||
+      typeof layer.visible !== "boolean" ||
+      typeof layer.locked !== "boolean"
+    ) {
+      throw new ShareProjectError("The shared project has invalid layers.");
+    }
+    layerIds.add(layer.id);
+  }
+
   const loadMap = new Map<string, number>();
-  for (const stitch of project.stitches) {
+  for (const stitch of getAllStitches(project)) {
     const strands = stitch.strands ?? 6;
     const coordinates = [
       stitch.from.col,
@@ -790,6 +940,10 @@ export function validateSharedProject(project: Project) {
     ) {
       throw new ShareProjectError("The shared project contains an invalid stitch.");
     }
+  }
+
+  for (const stitch of getVisibleStitches(project)) {
+    const strands = stitch.strands ?? 6;
     const capacity = canAddStitchWithLoadMap(
       loadMap,
       stitch.from,
@@ -806,6 +960,11 @@ export function validateSharedProject(project: Project) {
       loadMap.set(key, (loadMap.get(key) ?? 0) + strands);
     }
   }
+
+  const visibleValidation = validateVisibleComposite(project);
+  if (!visibleValidation.ok) {
+    throw new ShareProjectError(visibleValidation.reason);
+  }
 }
 
 export async function encodeShareProject(
@@ -821,7 +980,7 @@ export async function encodeShareProject(
   return {
     token: bytesToBase64Url(transport),
     transport,
-    mode: payload.m === "g" ? "grid" : "stitches",
+    mode: payload.l.every((layer) => layer.m === "g") ? "grid" : "stitches",
     compressedBytes: transport.byteLength,
     uncompressedBytes: jsonBytes.byteLength,
   };
@@ -845,9 +1004,11 @@ export async function decodeShareProject(
 }
 
 export function getShareTokenFromHash(hash: string) {
-  return hash.startsWith(SHARE_HASH_PREFIX)
-    ? hash.slice(SHARE_HASH_PREFIX.length)
-    : null;
+  if (hash.startsWith(SHARE_HASH_PREFIX)) return hash.slice(SHARE_HASH_PREFIX.length);
+  if (hash.startsWith(LEGACY_SHARE_HASH_PREFIX)) {
+    return hash.slice(LEGACY_SHARE_HASH_PREFIX.length);
+  }
+  return null;
 }
 
 export function buildShareUrl(token: string, currentHref: string) {

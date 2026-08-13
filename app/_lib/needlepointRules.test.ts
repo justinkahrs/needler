@@ -4,6 +4,7 @@ import {
   getHoleLoadMap,
   holeKey,
 } from "./needlepointRules";
+import { makeDefaultLayer, makeLayeredProject } from "./layers";
 import type { Project, Stitch } from "./needlepointTypes";
 
 function projectWithSharedHole(strands: number, count: number): Project {
@@ -15,8 +16,7 @@ function projectWithSharedHole(strands: number, count: number): Project {
     strands,
     thickness: 10,
   }));
-  return {
-    version: 2,
+  return makeLayeredProject({
     canvas: {
       cols: 127,
       rows: 169,
@@ -26,13 +26,13 @@ function projectWithSharedHole(strands: number, count: number): Project {
       material: "perforated-paper",
     },
     palette: [{ id: "dmc-321", name: "Red", hex: "#c72b3b" }],
-    stitches,
+    layers: [makeDefaultLayer(stitches)],
     colors: {
       roles: [{ id: "role-red", originalColorId: "dmc-321" }],
       current: {},
       colorways: [],
     },
-  };
+  });
 }
 
 describe("physical hole capacity", () => {

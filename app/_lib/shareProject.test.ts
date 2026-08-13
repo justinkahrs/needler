@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { PaletteColor, Project, Stitch } from "@/app/_lib/needlepointTypes";
+import {
+  getAllStitches,
+  makeDefaultLayer,
+  makeLayeredProject,
+  makeStitchLayer,
+} from "@/app/_lib/layers";
 import { serializeProject } from "@/app/_lib/persistence";
 import {
   ShareProjectError,
@@ -21,8 +27,7 @@ const color: PaletteColor = {
 };
 
 function projectWith(stitches: Stitch[]): Project {
-  return {
-    version: 2,
+  return makeLayeredProject({
     canvas: {
       cols: 127,
       rows: 169,
@@ -32,7 +37,7 @@ function projectWith(stitches: Stitch[]): Project {
       material: "perforated-paper",
     },
     palette: [color],
-    stitches,
+    layers: [makeDefaultLayer(stitches)],
     colors: {
       roles: [{ id: "role-red", originalColorId: color.id }],
       current: { "role-red": color.id },
@@ -41,7 +46,7 @@ function projectWith(stitches: Stitch[]): Project {
       ],
       activeColorwayId: "bright",
     },
-  };
+  });
 }
 
 function stitch(
@@ -150,8 +155,45 @@ describe("shared projects", () => {
 
     expect(encoded.mode).toBe("grid");
     expect(encoded.compressedBytes).toBeLessThan(10_000);
-    expect((await decodeShareProject(encoded.token)).project.stitches).toHaveLength(
+    expect(getAllStitches((await decodeShareProject(encoded.token)).project)).toHaveLength(
       21_168,
     );
+  });
+
+  it("round trips layer metadata including hidden and locked layers", async () => {
+    const project = makeLayeredProject({
+      canvas: projectWith([]).canvas,
+      palette: [color],
+      layers: [
+        makeStitchLayer({
+          id: "base",
+          name: "Base",
+          stitches: [stitch("base", 0, 1, 1, 0)],
+        }),
+        makeStitchLayer({
+          id: "hidden",
+          name: "Hidden alternate",
+          visible: false,
+          locked: true,
+          stitches: [stitch("hidden", 0, 0, 1, 1)],
+        }),
+      ],
+      activeLayerId: "hidden",
+      colors: {
+        roles: [{ id: "role-red", originalColorId: color.id }],
+        current: {},
+        colorways: [],
+      },
+    });
+    const decoded = await decodeShareProject((await encodeShareProject(project)).token);
+
+    expect(decoded.project.layers).toHaveLength(2);
+    expect(decoded.project.layers[1]).toMatchObject({
+      id: "hidden",
+      name: "Hidden alternate",
+      visible: false,
+      locked: true,
+    });
+    expect(decoded.project.activeLayerId).toBe("hidden");
   });
 });

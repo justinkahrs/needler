@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { PaletteColor, Project, Stitch } from "./needlepointTypes";
+import { makeDefaultLayer, makeLayeredProject } from "./layers";
 import {
   applyColorAssignments,
   assignmentsForColorway,
@@ -34,8 +35,7 @@ function makeProject(): Project {
     strands: 6,
   }));
 
-  return {
-    version: 2,
+  return makeLayeredProject({
     canvas: {
       cols: 127,
       rows: 169,
@@ -45,7 +45,7 @@ function makeProject(): Project {
       material: "perforated-paper",
     },
     palette,
-    stitches,
+    layers: [makeDefaultLayer(stitches)],
     colors: {
       roles: [
         { id: "role-dark", originalColorId: "dmc-310" },
@@ -55,7 +55,7 @@ function makeProject(): Project {
       current: {},
       colorways: [],
     },
-  };
+  });
 }
 
 describe("color roles", () => {
@@ -104,17 +104,24 @@ describe("color roles", () => {
     };
     const withNewRole: Project = {
       ...project,
-      stitches: [
-        ...project.stitches,
-        {
-          id: "new-role-stitch",
-          from: { col: 8, row: 1 },
-          to: { col: 9, row: 0 },
-          colorRoleId: "role-new",
-          thickness: 12,
-          strands: 6,
-        },
-      ],
+      layers: project.layers.map((layer, index) =>
+        index === 0
+          ? {
+              ...layer,
+              stitches: [
+                ...layer.stitches,
+                {
+                  id: "new-role-stitch",
+                  from: { col: 8, row: 1 },
+                  to: { col: 9, row: 0 },
+                  colorRoleId: "role-new",
+                  thickness: 12,
+                  strands: 6,
+                },
+              ],
+            }
+          : layer,
+      ),
       colors: {
         ...project.colors,
         roles: [
