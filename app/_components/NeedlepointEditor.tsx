@@ -736,6 +736,34 @@ function roundedRect(
   ctx.closePath();
 }
 
+function threadCapsulePath(
+  ctx: CanvasRenderingContext2D,
+  start: Point,
+  end: Point,
+  radius: number,
+) {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const length = Math.max(1, Math.hypot(dx, dy));
+  const normal = { x: -dy / length, y: dx / length };
+  const normalAngle = Math.atan2(normal.y, normal.x);
+
+  ctx.beginPath();
+  ctx.moveTo(start.x + normal.x * radius, start.y + normal.y * radius);
+  ctx.lineTo(end.x + normal.x * radius, end.y + normal.y * radius);
+  ctx.arc(end.x, end.y, radius, normalAngle, normalAngle - Math.PI, true);
+  ctx.lineTo(start.x - normal.x * radius, start.y - normal.y * radius);
+  ctx.arc(
+    start.x,
+    start.y,
+    radius,
+    normalAngle - Math.PI,
+    normalAngle,
+    true,
+  );
+  ctx.closePath();
+}
+
 function getStageRenderScale() {
   if (typeof window === "undefined") {
     return 1;
@@ -1092,9 +1120,18 @@ function drawThreadStitch(
     x: end.x + direction.x * capExtension,
     y: end.y + direction.y * capExtension,
   };
-  const middle = {
-    x: (renderStart.x + renderEnd.x) / 2,
-    y: (renderStart.y + renderEnd.y) / 2,
+  const strandExtension = threadWidth * 0.72;
+  const strandStart = {
+    x: renderStart.x - direction.x * strandExtension,
+    y: renderStart.y - direction.y * strandExtension,
+  };
+  const strandEnd = {
+    x: renderEnd.x + direction.x * strandExtension,
+    y: renderEnd.y + direction.y * strandExtension,
+  };
+  const strandMiddle = {
+    x: (strandStart.x + strandEnd.x) / 2,
+    y: (strandStart.y + strandEnd.y) / 2,
   };
   const ridgeCount = clamp(Math.round((stitch.strands ?? 6) + 1), 4, 10);
   const baseWidth = Math.max(1.45, threadWidth / ridgeCount);
@@ -1117,7 +1154,9 @@ function drawThreadStitch(
 
   ctx.save();
   ctx.globalAlpha = alpha;
-  ctx.lineCap = "round";
+  threadCapsulePath(ctx, renderStart, renderEnd, threadWidth / 2);
+  ctx.clip();
+  ctx.lineCap = "butt";
   ctx.lineJoin = "round";
 
   for (let index = 0; index < ridgeCount; index += 1) {
@@ -1130,12 +1169,12 @@ function drawThreadStitch(
     ctx.strokeStyle = shade;
     ctx.lineWidth = baseWidth * 1.18;
     ctx.beginPath();
-    ctx.moveTo(renderStart.x + normal.x * offset, renderStart.y + normal.y * offset);
+    ctx.moveTo(strandStart.x + normal.x * offset, strandStart.y + normal.y * offset);
     ctx.quadraticCurveTo(
-      middle.x + normal.x * (offset + curve),
-      middle.y + normal.y * (offset + curve),
-      renderEnd.x + normal.x * offset,
-      renderEnd.y + normal.y * offset,
+      strandMiddle.x + normal.x * (offset + curve),
+      strandMiddle.y + normal.y * (offset + curve),
+      strandEnd.x + normal.x * offset,
+      strandEnd.y + normal.y * offset,
     );
     ctx.stroke();
   }
@@ -1144,8 +1183,8 @@ function drawThreadStitch(
   ctx.strokeStyle = "rgba(255, 255, 255, 0.72)";
   ctx.lineWidth = 0.9;
   ctx.beginPath();
-  ctx.moveTo(renderStart.x + normal.x * -2, renderStart.y + normal.y * -2);
-  ctx.lineTo(renderEnd.x + normal.x * -2, renderEnd.y + normal.y * -2);
+  ctx.moveTo(strandStart.x + normal.x * -2, strandStart.y + normal.y * -2);
+  ctx.lineTo(strandEnd.x + normal.x * -2, strandEnd.y + normal.y * -2);
   ctx.stroke();
   ctx.restore();
 }
