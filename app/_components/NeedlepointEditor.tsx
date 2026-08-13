@@ -2,14 +2,18 @@
 
 import {
   Check,
+  Copy,
   Crop,
   Download,
   Eraser,
+  Eye,
+  EyeOff,
   FileText,
   ImageOff,
   ImagePlus,
   Layers3,
   LoaderCircle,
+  Lock,
   Maximize2,
   Minus,
   Move,
@@ -28,6 +32,7 @@ import {
   Share2,
   Trash2,
   Undo2,
+  Unlock,
   X,
 } from "lucide-react";
 import ColorwayStudio from "@/app/_components/ColorwayStudio";
@@ -38,6 +43,7 @@ import {
   LEGACY_PROJECT_STORAGE_KEY,
   PREVIOUS_PROJECT_STORAGE_KEY,
   PROJECT_STORAGE_KEY,
+  OLDEST_PROJECT_STORAGE_KEY,
   deserializeProject,
   serializeProject,
 } from "@/app/_lib/persistence";
@@ -63,6 +69,31 @@ import {
   updateReferenceImage,
 } from "@/app/_lib/referenceImages";
 import type { ReferenceImageState } from "@/app/_lib/referenceImages";
+import {
+  addLayer,
+  addLayerWithStitches,
+  appendStitchesToLayer,
+  deleteLayer,
+  duplicateLayer,
+  getActiveLayer,
+  getAllStitchCount,
+  getEditableActiveLayer,
+  getVisibleStitches,
+  makeDefaultLayer,
+  makeLayeredProject,
+  makeStitchLayer,
+  mergeLayerDown,
+  moveActiveLayerBy,
+  moveLayer,
+  recolorActiveLayer,
+  renameLayer,
+  replaceLayerStitches,
+  resizeActiveLayer,
+  rotateActiveLayer,
+  selectLayer,
+  toggleLayerLock,
+  toggleLayerVisibility,
+} from "@/app/_lib/layers";
 import {
   MAX_HOLE_STRAND_UNITS,
   canAddStitch,
@@ -111,7 +142,7 @@ import type { ReactNode } from "react";
 
 type Tool = "stitch" | "erase" | "pan" | "image" | "eyedropper";
 type PreviewMode = "image" | "pattern" | "both";
-type RightPanelMode = "inspector" | "colorways" | "share";
+type RightPanelMode = "inspector" | "layers" | "colorways" | "share";
 type DragState = { from: Hole; to: Hole | null } | null;
 type PanDragState =
   | {
@@ -295,13 +326,12 @@ function makeSheetCanvas(): Project["canvas"] {
 }
 
 function makeDefaultProject(): Project {
-  return {
-    version: 2,
+  return makeLayeredProject({
     canvas: makeSheetCanvas(),
     palette: DEFAULT_PALETTE.map((color) => ({ ...color })),
-    stitches: [],
     colors: makeEmptyColorState(),
-  };
+    layers: [makeDefaultLayer()],
+  });
 }
 
 function getPaletteLabel(color: PaletteColor) {
@@ -336,7 +366,7 @@ function normalizeProject(project: Project): Project {
     originalColorId: migrateColorId(role.originalColorId),
   }));
   const roleIds = new Set(roles.map((role) => role.id));
-  for (const stitch of project.stitches) {
+  for (const stitch of project.layers.flatMap((layer) => layer.stitches)) {
     if (!roleIds.has(stitch.colorRoleId)) {
       roles.push({
         id: stitch.colorRoleId,
@@ -353,27 +383,9 @@ function normalizeProject(project: Project): Project {
       ]),
     );
 
-  return {
-    ...project,
-    version: 2,
+  return makeLayeredProject({
     canvas,
     palette: [...paletteById.values()],
-    stitches: project.stitches
-      .map((stitch) => {
-        const nextStrands =
-          stitch.strands ?? getLegacyStrandsFromThickness(stitch.thickness);
-
-        return {
-          ...stitch,
-          strands: nextStrands,
-          thickness: getThreadWidthForStrands(nextStrands),
-        };
-      })
-      .filter(
-        (stitch) =>
-          isHoleWithinCanvas(stitch.from, canvas) &&
-          isHoleWithinCanvas(stitch.to, canvas),
-      ),
     colors: {
       roles,
       current: migrateAssignments(project.colors.current),
@@ -383,7 +395,27 @@ function normalizeProject(project: Project): Project {
       })),
       activeColorwayId: project.colors.activeColorwayId,
     },
-  };
+    layers: project.layers.map((layer) => ({
+      ...layer,
+      stitches: layer.stitches
+        .map((stitch) => {
+          const nextStrands =
+            stitch.strands ?? getLegacyStrandsFromThickness(stitch.thickness);
+
+          return {
+            ...stitch,
+            strands: nextStrands,
+            thickness: getThreadWidthForStrands(nextStrands),
+          };
+        })
+        .filter(
+          (stitch) =>
+            isHoleWithinCanvas(stitch.from, canvas) &&
+            isHoleWithinCanvas(stitch.to, canvas),
+        ),
+    })),
+    activeLayerId: project.activeLayerId,
+  });
 }
 
 function editorReducer(state: EditorState, action: EditorAction): EditorState {
@@ -649,7 +681,7 @@ function getHoleFillMap(
 ) {
   const fillMap = new Map<string, HoleFill>();
 
-  for (const stitch of project.stitches) {
+  for (const stitch of getVisibleStitches(project)) {
     const strands = getStitchStrands(stitch);
     const color = rolePalette.get(stitch.colorRoleId)?.hex ?? project.palette[0]?.hex;
 
@@ -1254,18 +1286,18 @@ type DenseStitchGroup = {
   width: number;
 };
 
-const denseStitchCache = new WeakMap<Stitch[], DenseStitchGroup[]>();
+const denseStitchCache = new WeakMap<Project, DenseStitchGroup[]>();
 const denseHoleFillCache = new WeakMap<Project, Map<string, HoleFill>>();
 const previewHoleFillCache = new WeakMap<object, Map<string, HoleFill>>();
 const draftPathCache = new WeakMap<PatternDraft, DenseStitchGroup[]>();
 
 function getDenseStitchGroups(project: Project) {
-  const cached = denseStitchCache.get(project.stitches);
+  const cached = denseStitchCache.get(project);
   if (cached) return cached;
 
   const groups = new Map<string, DenseStitchGroup>();
 
-  for (const stitch of project.stitches) {
+  for (const stitch of getVisibleStitches(project)) {
     const width = getStitchWidth(stitch);
     const key = `${stitch.colorRoleId}:${width.toFixed(2)}`;
     const group = groups.get(key) ?? {
@@ -1281,7 +1313,7 @@ function getDenseStitchGroups(project: Project) {
   }
 
   const result = [...groups.values()];
-  denseStitchCache.set(project.stitches, result);
+  denseStitchCache.set(project, result);
   return result;
 }
 
@@ -1332,14 +1364,15 @@ function drawStitches(
   assignments?: Record<string, string>,
   visibleBounds?: WorldBounds | null,
 ) {
-  if (project.stitches.length > 1200) {
+  const visibleStitches = getVisibleStitches(project);
+  if (visibleStitches.length > 1200) {
     drawDenseStitches(ctx, project, assignments);
     return;
   }
 
   const rolePalette = buildResolvedRolePalette(project, assignments);
 
-  for (const stitch of project.stitches) {
+  for (const stitch of visibleStitches) {
     const color = rolePalette.get(stitch.colorRoleId)?.hex ?? project.palette[0]?.hex;
 
     if (!color) {
@@ -1529,35 +1562,39 @@ function distanceToSegment(point: Point, start: Point, end: Point) {
   return Math.hypot(point.x - projection.x, point.y - projection.y);
 }
 
-type StitchSpatialIndex = Map<string, Stitch[]>;
+type LayeredStitch = { stitch: Stitch; layerId: string };
+type StitchSpatialIndex = Map<string, LayeredStitch[]>;
 const stitchSpatialCache = new WeakMap<Project, StitchSpatialIndex>();
 
-function getStitchSpatialIndex(project: Project) {
+function getStitchSpatialIndex(project: Project, layerId?: string) {
   const cached = stitchSpatialCache.get(project);
-  if (cached) return cached;
+  if (cached && !layerId) return cached;
   const index: StitchSpatialIndex = new Map();
 
-  for (const stitch of project.stitches) {
-    const colDelta = stitch.to.col - stitch.from.col;
-    const rowDelta = stitch.to.row - stitch.from.row;
-    const steps = Math.max(Math.abs(colDelta), Math.abs(rowDelta), 1);
-    const keys = new Set<string>();
+  for (const layer of project.layers) {
+    if (!layer.visible || (layerId && layer.id !== layerId)) continue;
+    for (const stitch of layer.stitches) {
+      const colDelta = stitch.to.col - stitch.from.col;
+      const rowDelta = stitch.to.row - stitch.from.row;
+      const steps = Math.max(Math.abs(colDelta), Math.abs(rowDelta), 1);
+      const keys = new Set<string>();
 
-    for (let step = 0; step <= steps; step += 1) {
-      const ratio = step / steps;
-      const col = Math.floor(stitch.from.col + colDelta * ratio);
-      const row = Math.floor(stitch.from.row + rowDelta * ratio);
-      keys.add(`${col}:${row}`);
-    }
+      for (let step = 0; step <= steps; step += 1) {
+        const ratio = step / steps;
+        const col = Math.floor(stitch.from.col + colDelta * ratio);
+        const row = Math.floor(stitch.from.row + rowDelta * ratio);
+        keys.add(`${col}:${row}`);
+      }
 
-    for (const key of keys) {
-      const bucket = index.get(key) ?? [];
-      bucket.push(stitch);
-      index.set(key, bucket);
+      for (const key of keys) {
+        const bucket = index.get(key) ?? [];
+        bucket.push({ stitch, layerId: layer.id });
+        index.set(key, bucket);
+      }
     }
   }
 
-  stitchSpatialCache.set(project, index);
+  if (!layerId) stitchSpatialCache.set(project, index);
   return index;
 }
 
@@ -1565,38 +1602,47 @@ function findNearestStitch(
   point: Point,
   project: Project,
   view: ViewState,
-): Stitch | null {
-  let nearest: { stitch: Stitch; distance: number } | null = null;
+  layerId?: string,
+): LayeredStitch | null {
+  let nearest: { layered: LayeredStitch; distance: number; order: number } | null = null;
   const screenDistance = 13 / view.zoom;
   const spacing = getGridSpacing(project.canvas);
   const padding = getGridPadding(project.canvas);
   const col = Math.floor((point.x - padding) / spacing);
   const row = Math.floor((point.y - padding) / spacing);
-  const candidates = new Map<string, Stitch>();
-  const spatialIndex = getStitchSpatialIndex(project);
+  const candidates = new Map<string, LayeredStitch>();
+  const layerOrder = new Map(project.layers.map((layer, index) => [layer.id, index]));
+  const spatialIndex = getStitchSpatialIndex(project, layerId);
 
   for (let rowOffset = -1; rowOffset <= 1; rowOffset += 1) {
     for (let colOffset = -1; colOffset <= 1; colOffset += 1) {
-      for (const stitch of spatialIndex.get(`${col + colOffset}:${row + rowOffset}`) ?? []) {
-        candidates.set(stitch.id, stitch);
+      for (const layered of spatialIndex.get(`${col + colOffset}:${row + rowOffset}`) ?? []) {
+        candidates.set(`${layered.layerId}:${layered.stitch.id}`, layered);
       }
     }
   }
 
-  for (const stitch of candidates.values()) {
+  for (const layered of candidates.values()) {
+    const { stitch } = layered;
     const distance = distanceToSegment(
       point,
       holeToWorld(stitch.from, project.canvas),
       holeToWorld(stitch.to, project.canvas),
     );
     const threshold = screenDistance + getStitchWidth(stitch) * 0.5;
+    const order = layerOrder.get(layered.layerId) ?? 0;
 
-    if (distance <= threshold && (!nearest || distance < nearest.distance)) {
-      nearest = { stitch, distance };
+    if (
+      distance <= threshold &&
+      (!nearest ||
+        order > nearest.order ||
+        (order === nearest.order && distance < nearest.distance))
+    ) {
+      nearest = { layered, distance, order };
     }
   }
 
-  return nearest?.stitch ?? null;
+  return nearest?.layered ?? null;
 }
 
 function makeStitch(from: Hole, to: Hole, colorRoleId: string, strands: number) {
@@ -1631,12 +1677,22 @@ function addStitchLoad(loadMap: Map<string, number>, hole: Hole, strands: number
 function applyPatternDraft(
   project: Project,
   draft: PatternDraft,
-  mode: "replace" | "fill",
+  mode: "replace" | "fill" | "current",
 ) {
-  const baseStitches = mode === "replace" ? [] : project.stitches;
+  const editable = mode === "current" ? getEditableActiveLayer(project) : null;
+  if (editable && !editable.ok) {
+    return {
+      project,
+      additions: 0,
+      occupiedSkipped: 0,
+      capacitySkipped: 0,
+      colorsAdded: 0,
+      blockedReason: editable.reason,
+    };
+  }
   const occupied = new Set(
-    mode === "fill"
-      ? project.stitches
+    mode === "fill" || mode === "current"
+      ? getVisibleStitches(project)
           .map(unitDiagonalCellKey)
           .filter((key): key is string => Boolean(key))
       : [],
@@ -1718,10 +1774,17 @@ function applyPatternDraft(
   });
 
   return {
-    project: {
-      ...nextProject,
-      stitches: [...baseStitches, ...additions],
-    },
+    project:
+      mode === "replace"
+        ? makeLayeredProject({
+            canvas: nextProject.canvas,
+            palette: nextProject.palette,
+            colors: nextProject.colors,
+            layers: [makeStitchLayer({ name: "Image pattern", stitches: additions })],
+          })
+        : mode === "current" && editable?.ok
+          ? appendStitchesToLayer(nextProject, editable.layer.id, additions)
+          : addLayerWithStitches(nextProject, "Image pattern", additions),
     additions: additions.length,
     occupiedSkipped,
     capacitySkipped,
@@ -1900,6 +1963,8 @@ function getPanelLabel(mode: RightPanelMode) {
   switch (mode) {
     case "inspector":
       return "Inspector";
+    case "layers":
+      return "Layers";
     case "colorways":
       return "Colorways";
     case "share":
@@ -2011,6 +2076,10 @@ export default function NeedlepointEditor() {
   const [pdfJob, setPdfJob] = useState<PdfJobState>({ status: "idle" });
   const [rightPanelMode, setRightPanelMode] =
     useState<RightPanelMode>("inspector");
+  const [layerNameDrafts, setLayerNameDrafts] = useState<Record<string, string>>({});
+  const [layerDeleteConfirmId, setLayerDeleteConfirmId] = useState<string | null>(
+    null,
+  );
   const [toolRailCollapsed, setToolRailCollapsed] = useState(false);
   const [panelCollapsed, setPanelCollapsed] = useState(false);
   const [initialColorwayRoleId, setInitialColorwayRoleId] = useState<
@@ -2045,6 +2114,14 @@ export default function NeedlepointEditor() {
   const viewFrameRef = useRef<number | null>(null);
 
   const meshCount = getMeshCount(project.canvas);
+  const visibleStitches = useMemo(() => getVisibleStitches(project), [project]);
+  const visibleStitchCount = visibleStitches.length;
+  const allStitchCount = useMemo(() => getAllStitchCount(project), [project]);
+  const activeLayer = getActiveLayer(project);
+  const editableActiveLayer = getEditableActiveLayer(project);
+  const activeLayerNameDraft = activeLayer
+    ? (layerNameDrafts[activeLayer.id] ?? activeLayer.name)
+    : "";
   const physicalWidth = project.canvas.widthIn;
   const physicalHeight = project.canvas.heightIn;
   const stitchCellsWide = project.canvas.cols - 1;
@@ -2326,6 +2403,7 @@ export default function NeedlepointEditor() {
           PROJECT_STORAGE_KEY,
           PREVIOUS_PROJECT_STORAGE_KEY,
           LEGACY_PROJECT_STORAGE_KEY,
+          OLDEST_PROJECT_STORAGE_KEY,
         ]) {
           const savedProject = window.localStorage.getItem(key);
           if (!savedProject) continue;
@@ -2576,7 +2654,7 @@ export default function NeedlepointEditor() {
     const isDragBlocked = dragCapacity?.canAdd === false;
 
     if (hoveredStitchId) {
-      const hovered = project.stitches.find((stitch) => stitch.id === hoveredStitchId);
+      const hovered = visibleStitches.find((stitch) => stitch.id === hoveredStitchId);
 
       if (hovered) {
         const start = holeToWorld(hovered.from, project.canvas);
@@ -2651,7 +2729,7 @@ export default function NeedlepointEditor() {
     holeLoadMap,
     hoveredStitchId,
     project.canvas,
-    project.stitches,
+    visibleStitches,
     patternDraft,
     previewMode,
     strandCount,
@@ -2977,19 +3055,42 @@ export default function NeedlepointEditor() {
     }
 
     if (tool === "erase") {
-      const target = findNearestStitch(worldPoint, project, currentView);
+      const editable = getEditableActiveLayer(project);
+
+      if (!editable.ok) {
+        notify(editable.reason, "warn");
+        return;
+      }
+
+      const target = findNearestStitch(
+        worldPoint,
+        project,
+        currentView,
+        editable.layer.id,
+      );
 
       if (!target) {
         notify("No stitch selected.", "warn");
         return;
       }
 
-      commitProject({
-        ...project,
-        stitches: project.stitches.filter((stitch) => stitch.id !== target.id),
-      });
+      commitProject(
+        replaceLayerStitches(
+          project,
+          target.layerId,
+          editable.layer.stitches.filter((stitch) => stitch.id !== target.stitch.id),
+        ),
+      );
       notify("Stitch removed.", "success");
       return;
+    }
+
+    if (tool === "stitch") {
+      const editable = getEditableActiveLayer(project);
+      if (!editable.ok) {
+        notify(editable.reason, "warn");
+        return;
+      }
     }
 
     const startHole = nearestHole(worldPoint, project.canvas);
@@ -3074,8 +3175,12 @@ export default function NeedlepointEditor() {
 
     if (tool === "erase") {
       setHoverHole(nearestHole(worldPoint, project.canvas));
+      const editable = getEditableActiveLayer(project);
       setHoveredStitchId(
-        findNearestStitch(worldPoint, project, currentView)?.id ?? null,
+        editable.ok
+          ? findNearestStitch(worldPoint, project, currentView, editable.layer.id)?.stitch.id ??
+              null
+          : null,
       );
       return;
     }
@@ -3154,13 +3259,16 @@ export default function NeedlepointEditor() {
     }
 
     const ensured = ensureColorRole(project, activeColorId);
-    commitProject({
-      ...ensured.project,
-      stitches: [
-        ...project.stitches,
+    const editable = getEditableActiveLayer(ensured.project);
+    if (!editable.ok) {
+      notify(editable.reason, "warn");
+      return;
+    }
+    commitProject(
+      appendStitchesToLayer(ensured.project, editable.layer.id, [
         makeStitch(drag.from, destination, ensured.roleId, strandCount),
-      ],
-    });
+      ]),
+    );
   };
 
   const handlePointerCancel = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -3615,9 +3723,13 @@ export default function NeedlepointEditor() {
     );
   };
 
-  const commitPatternDraft = (mode: "replace" | "fill") => {
+  const commitPatternDraft = (mode: "replace" | "fill" | "current") => {
     if (!patternDraft || patternDraft.stats.stitchedCells === 0) return;
     const result = applyPatternDraft(project, patternDraft, mode);
+    if (result.blockedReason) {
+      notify(result.blockedReason, "warn");
+      return;
+    }
     commitProject(result.project);
     setPatternDraft(null);
     setReplaceConfirmed(false);
@@ -3633,7 +3745,7 @@ export default function NeedlepointEditor() {
   };
 
   const replaceWithPattern = () => {
-    if (project.stitches.length > 0 && !replaceConfirmed) {
+    if (allStitchCount > 0 && !replaceConfirmed) {
       setReplaceConfirmed(true);
       return;
     }
@@ -3649,7 +3761,7 @@ export default function NeedlepointEditor() {
   };
 
   const exportPatternPdf = async () => {
-    if (project.stitches.length === 0) {
+    if (visibleStitchCount === 0) {
       notify("Add stitches before exporting a pattern.", "warn");
       return;
     }
@@ -3725,6 +3837,80 @@ export default function NeedlepointEditor() {
     setPatternSettings((current) => ({ ...current, ...updates }));
     setPatternDraft(null);
     setReplaceConfirmed(false);
+  };
+
+  const commitLayerProject = (nextProject: Project, message: string) => {
+    commitProject(nextProject);
+    setLayerDeleteConfirmId(null);
+    notify(message, "success");
+  };
+
+  const commitLayerResult = (result: ReturnType<typeof moveActiveLayerBy>, message: string) => {
+    if (!result.ok) {
+      notify(result.reason, "warn");
+      return;
+    }
+    commitLayerProject(result.project, message);
+  };
+
+  const createLayer = () => {
+    commitLayerProject(addLayer(project), "Layer added.");
+    setRightPanelMode("layers");
+    setPanelCollapsed(false);
+  };
+
+  const deleteLayerWithConfirm = (layerId: string) => {
+    const layer = project.layers.find((item) => item.id === layerId);
+    if (!layer) return;
+    if (project.layers.length <= 1) {
+      notify("At least one layer is required.", "warn");
+      return;
+    }
+    if (layer.stitches.length > 0 && layerDeleteConfirmId !== `delete:${layerId}`) {
+      setLayerDeleteConfirmId(`delete:${layerId}`);
+      notify("Confirm delete to remove this layer's stitches.", "warn");
+      return;
+    }
+    commitLayerProject(deleteLayer(project, layerId), "Layer deleted.");
+  };
+
+  const mergeLayerWithConfirm = (layerId: string) => {
+    const layerIndex = project.layers.findIndex((layer) => layer.id === layerId);
+    if (layerIndex <= 0) {
+      notify("Choose a layer above another layer to merge down.", "warn");
+      return;
+    }
+    if (layerDeleteConfirmId !== `merge:${layerId}`) {
+      setLayerDeleteConfirmId(`merge:${layerId}`);
+      notify("Confirm merge to combine this layer with the one below.", "warn");
+      return;
+    }
+    commitLayerProject(mergeLayerDown(project, layerId), "Layer merged.");
+  };
+
+  const toggleVisibility = (layerId: string) => {
+    const result = toggleLayerVisibility(project, layerId);
+    if (!result.ok) {
+      notify(result.reason, "warn");
+      return;
+    }
+    commitLayerProject(result.project, "Layer visibility changed.");
+  };
+
+  const renameActiveLayer = () => {
+    if (!activeLayer) return;
+    commitLayerProject(
+      renameLayer(project, activeLayer.id, activeLayerNameDraft),
+      "Layer renamed.",
+    );
+  };
+
+  const recolorLayerToSelectedThread = () => {
+    const ensured = ensureColorRole(project, activeColorId);
+    commitLayerResult(
+      recolorActiveLayer(ensured.project, ensured.roleId),
+      "Layer recolored.",
+    );
   };
 
   const activeToolLabel = getToolLabel(tool);
@@ -3867,6 +4053,16 @@ export default function NeedlepointEditor() {
             >
               <Share2 size={18} strokeWidth={1.8} />
             </IconButton>
+            <IconButton
+              label="Layers"
+              active={rightPanelMode === "layers"}
+              onClick={() => {
+                setPanelCollapsed(false);
+                setRightPanelMode("layers");
+              }}
+            >
+              <Layers3 size={18} strokeWidth={1.8} />
+            </IconButton>
             <IconButton label="Export PNG" disabled={exporting} onClick={exportPng}>
               {exporting ? (
                 <LoaderCircle size={18} strokeWidth={1.8} className="animate-spin" />
@@ -3876,7 +4072,7 @@ export default function NeedlepointEditor() {
             </IconButton>
             <IconButton
               label="Export printable pattern PDF"
-              disabled={isPdfExporting || project.stitches.length === 0}
+              disabled={isPdfExporting || visibleStitchCount === 0}
               onClick={exportPatternPdf}
             >
               {isPdfExporting ? (
@@ -4268,7 +4464,7 @@ export default function NeedlepointEditor() {
                 </div>
               </div>
             ) : null}
-            {project.stitches.length === 0 ? (
+            {visibleStitchCount === 0 ? (
               <div
                 className="pointer-events-none absolute max-w-[230px] rounded-md border border-[#e2cbb2] bg-[#fff8ef]/88 px-3 py-2 text-sm text-[#765943] shadow-[0_12px_30px_-24px_rgba(58,35,22,0.42)]"
                 style={{
@@ -4317,6 +4513,32 @@ export default function NeedlepointEditor() {
               <span className="h-2 w-2 rounded-full bg-[#6f8d62]" />
               {editorStatusLabel}
             </div>
+            <button
+              type="button"
+              className={[
+                "pointer-events-auto absolute max-w-[260px] truncate rounded-md border px-3 py-2 text-left text-xs font-medium shadow-[0_12px_30px_-24px_rgba(58,35,22,0.42)] transition active:translate-y-px",
+                editableActiveLayer.ok
+                  ? "border-[#e2cbb2] bg-[#fff8ef]/88 text-[#765943]"
+                  : "border-[#cfa098] bg-[#fff3ef]/92 text-[#8a332c]",
+              ].join(" ")}
+              style={{
+                bottom: "max(3.8rem, calc(env(safe-area-inset-bottom) + 3.8rem))",
+                right: "max(0.75rem, env(safe-area-inset-right))",
+              }}
+              onPointerDown={stopStageOverlayEvent}
+              onWheel={stopStageOverlayEvent}
+              onClick={() => {
+                setPanelCollapsed(false);
+                setRightPanelMode("layers");
+              }}
+            >
+              <span className="inline-flex min-w-0 items-center gap-2">
+                <Layers3 size={14} strokeWidth={1.8} className="shrink-0" />
+                <span className="truncate">{activeLayer?.name ?? "Layer"}</span>
+                {activeLayer?.visible ? null : <EyeOff size={13} strokeWidth={1.8} />}
+                {activeLayer?.locked ? <Lock size={13} strokeWidth={1.8} /> : null}
+              </span>
+            </button>
           </div>
         </section>
 
@@ -4362,7 +4584,7 @@ export default function NeedlepointEditor() {
         <aside className="flex h-full min-h-0 flex-col gap-4 overflow-auto rounded-lg border border-[#d6bfa6] bg-[#fff8ef] p-4 shadow-[0_20px_44px_-30px_rgba(87,55,35,0.32)]">
           <div className="flex items-center justify-between gap-3 border-b border-[#e4d2bf] pb-3">
             <span className="text-xs font-semibold uppercase tracking-[0.1em] text-[#765943]">
-              Inspector
+              {activePanelLabel}
             </span>
             <button
               type="button"
@@ -4374,6 +4596,252 @@ export default function NeedlepointEditor() {
               <PanelRightClose size={17} strokeWidth={1.8} />
             </button>
           </div>
+
+          <section>
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-semibold uppercase tracking-[0.1em] text-[#765943]">
+                  Layers
+                </h2>
+                <p className="mt-1 text-xs text-[#8a6c55]">
+                  {project.layers.length} layers, {visibleStitchCount.toLocaleString()} visible stitches
+                </p>
+              </div>
+              <button
+                type="button"
+                className={panelButtonClass("solid")}
+                onClick={createLayer}
+              >
+                <Plus size={16} strokeWidth={1.8} />
+                Add
+              </button>
+            </div>
+
+            <div className="mt-3 grid gap-2">
+              {[...project.layers].reverse().map((layer) => {
+                const isActive = layer.id === project.activeLayerId;
+                const layerIndex = project.layers.findIndex((item) => item.id === layer.id);
+                const confirmDelete = layerDeleteConfirmId === `delete:${layer.id}`;
+                const confirmMerge = layerDeleteConfirmId === `merge:${layer.id}`;
+
+                return (
+                  <div
+                    key={layer.id}
+                    className={[
+                      "rounded-md border bg-white/70 p-2",
+                      isActive ? "border-[#7e4e36]" : "border-[#e4d2bf]",
+                    ].join(" ")}
+                    onPointerDown={stopStageOverlayEvent}
+                    onWheel={stopStageOverlayEvent}
+                  >
+                    <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
+                      <button
+                        type="button"
+                        className="min-w-0 text-left"
+                        onClick={() => {
+                          commitLayerProject(selectLayer(project, layer.id), "Layer selected.");
+                          setRightPanelMode("layers");
+                        }}
+                      >
+                        <span className="block truncate text-sm font-medium text-[#3d2b1f]">
+                          {layer.name}
+                        </span>
+                        <span className="block font-mono text-[10px] uppercase text-[#8a6c55]">
+                          {layer.stitches.length.toLocaleString()} stitches
+                          {isActive ? " | active" : ""}
+                        </span>
+                      </button>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          aria-label={layer.visible ? "Hide layer" : "Show layer"}
+                          title={layer.visible ? "Hide layer" : "Show layer"}
+                          className="flex h-8 w-8 items-center justify-center rounded-md border border-[#d8c4ad] bg-white text-[#654a38]"
+                          onClick={() => toggleVisibility(layer.id)}
+                        >
+                          {layer.visible ? (
+                            <Eye size={15} strokeWidth={1.8} />
+                          ) : (
+                            <EyeOff size={15} strokeWidth={1.8} />
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={layer.locked ? "Unlock layer" : "Lock layer"}
+                          title={layer.locked ? "Unlock layer" : "Lock layer"}
+                          className="flex h-8 w-8 items-center justify-center rounded-md border border-[#d8c4ad] bg-white text-[#654a38]"
+                          onClick={() =>
+                            commitLayerProject(
+                              toggleLayerLock(project, layer.id),
+                              layer.locked ? "Layer unlocked." : "Layer locked.",
+                            )
+                          }
+                        >
+                          {layer.locked ? (
+                            <Lock size={15} strokeWidth={1.8} />
+                          ) : (
+                            <Unlock size={15} strokeWidth={1.8} />
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="mt-2 grid grid-cols-5 gap-1">
+                      <button
+                        type="button"
+                        className={panelButtonClass()}
+                        disabled={layerIndex === project.layers.length - 1}
+                        onClick={() =>
+                          commitLayerProject(moveLayer(project, layer.id, 1), "Layer moved.")
+                        }
+                      >
+                        Up
+                      </button>
+                      <button
+                        type="button"
+                        className={panelButtonClass()}
+                        disabled={layerIndex === 0}
+                        onClick={() =>
+                          commitLayerProject(moveLayer(project, layer.id, -1), "Layer moved.")
+                        }
+                      >
+                        Down
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Duplicate ${layer.name}`}
+                        title="Duplicate layer"
+                        className={panelButtonClass()}
+                        onClick={() =>
+                          commitLayerProject(duplicateLayer(project, layer.id), "Layer duplicated.")
+                        }
+                      >
+                        <Copy size={14} strokeWidth={1.8} />
+                      </button>
+                      <button
+                        type="button"
+                        className={panelButtonClass(confirmMerge ? "solid" : "quiet")}
+                        disabled={layerIndex === 0}
+                        onClick={() => mergeLayerWithConfirm(layer.id)}
+                      >
+                        Merge
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Delete ${layer.name}`}
+                        title="Delete layer"
+                        className={panelButtonClass(confirmDelete ? "solid" : "quiet")}
+                        disabled={project.layers.length <= 1}
+                        onClick={() => deleteLayerWithConfirm(layer.id)}
+                      >
+                        <Trash2 size={14} strokeWidth={1.8} />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {activeLayer ? (
+              <div
+                className="mt-3 grid gap-3 rounded-md border border-[#e4d2bf] bg-white/60 p-3"
+                onPointerDown={stopStageOverlayEvent}
+                onWheel={stopStageOverlayEvent}
+              >
+                <label className="grid gap-1 text-xs font-semibold uppercase tracking-[0.08em] text-[#765943]">
+                  Active layer name
+                  <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+                    <input
+                      type="text"
+                      value={activeLayerNameDraft}
+                      className="h-9 min-w-0 rounded-md border border-[#d8c4ad] bg-white px-2 text-sm normal-case tracking-normal text-[#3d2b1f] outline-none focus:border-[#7e4e36]"
+                      onChange={(event) =>
+                        setLayerNameDrafts((current) => ({
+                          ...current,
+                          [activeLayer.id]: event.target.value,
+                        }))
+                      }
+                    />
+                    <button
+                      type="button"
+                      className={panelButtonClass()}
+                      onClick={renameActiveLayer}
+                    >
+                      Save
+                    </button>
+                  </div>
+                </label>
+                <div className="grid grid-cols-4 gap-1">
+                  <button
+                    type="button"
+                    className={panelButtonClass()}
+                    onClick={() => commitLayerResult(moveActiveLayerBy(project, -1, 0), "Layer moved.")}
+                  >
+                    Left
+                  </button>
+                  <button
+                    type="button"
+                    className={panelButtonClass()}
+                    onClick={() => commitLayerResult(moveActiveLayerBy(project, 1, 0), "Layer moved.")}
+                  >
+                    Right
+                  </button>
+                  <button
+                    type="button"
+                    className={panelButtonClass()}
+                    onClick={() => commitLayerResult(moveActiveLayerBy(project, 0, -1), "Layer moved.")}
+                  >
+                    Up
+                  </button>
+                  <button
+                    type="button"
+                    className={panelButtonClass()}
+                    onClick={() => commitLayerResult(moveActiveLayerBy(project, 0, 1), "Layer moved.")}
+                  >
+                    Down
+                  </button>
+                </div>
+                <div className="grid grid-cols-3 gap-1">
+                  <button
+                    type="button"
+                    className={panelButtonClass()}
+                    onClick={() => commitLayerResult(rotateActiveLayer(project, 1), "Layer rotated.")}
+                  >
+                    <RotateCw size={15} strokeWidth={1.8} />
+                    90
+                  </button>
+                  <button
+                    type="button"
+                    className={panelButtonClass()}
+                    onClick={() => commitLayerResult(resizeActiveLayer(project, 0.9), "Layer resized.")}
+                  >
+                    Smaller
+                  </button>
+                  <button
+                    type="button"
+                    className={panelButtonClass()}
+                    onClick={() => commitLayerResult(resizeActiveLayer(project, 1.1), "Layer resized.")}
+                  >
+                    Larger
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  className={panelButtonClass("solid")}
+                  disabled={!selectedColor}
+                  onClick={recolorLayerToSelectedThread}
+                >
+                  <Palette size={15} strokeWidth={1.8} />
+                  Recolor to selected thread
+                </button>
+                {!editableActiveLayer.ok ? (
+                  <p className="rounded-md border border-[#cfa098] bg-[#fff3ef] px-2 py-1.5 text-xs text-[#8a332c]">
+                    {editableActiveLayer.reason}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+          </section>
+
           <section>
             <div className="flex items-start justify-between gap-3">
               <div>
@@ -4417,7 +4885,7 @@ export default function NeedlepointEditor() {
             <button
               type="button"
               className={`${panelButtonClass("solid")} mt-3 w-full`}
-              disabled={project.stitches.length === 0 || Boolean(patternDraft)}
+              disabled={allStitchCount === 0 || Boolean(patternDraft)}
               onClick={() => openColorwayStudio()}
             >
               <Palette size={16} strokeWidth={1.8} />
@@ -4711,7 +5179,7 @@ export default function NeedlepointEditor() {
                           type="button"
                           disabled={
                             !patternDraft &&
-                            project.stitches.length === 0 &&
+                            visibleStitchCount === 0 &&
                             mode === "pattern"
                           }
                           className={[
@@ -4905,7 +5373,7 @@ export default function NeedlepointEditor() {
                           </div>
                         ))}
                       </div>
-                      {project.stitches.length === 0 ? (
+                      {visibleStitchCount === 0 ? (
                         <button
                           type="button"
                           className={panelButtonClass("solid")}
@@ -4916,7 +5384,7 @@ export default function NeedlepointEditor() {
                         </button>
                       ) : (
                         <div className="grid gap-2">
-                          <div className="grid grid-cols-2 gap-2">
+                          <div className="grid grid-cols-3 gap-2">
                             <button
                               type="button"
                               className={panelButtonClass("solid")}
@@ -4924,6 +5392,15 @@ export default function NeedlepointEditor() {
                             >
                               <Plus size={16} strokeWidth={1.8} />
                               Add empty
+                            </button>
+                            <button
+                              type="button"
+                              className={panelButtonClass()}
+                              disabled={!editableActiveLayer.ok}
+                              onClick={() => commitPatternDraft("current")}
+                            >
+                              <Layers3 size={16} strokeWidth={1.8} />
+                              Active
                             </button>
                             <button
                               type="button"
@@ -5171,7 +5648,7 @@ export default function NeedlepointEditor() {
               <button
                 type="button"
                 className={`${panelButtonClass("solid")} mt-2 w-full`}
-                disabled={isPdfExporting || project.stitches.length === 0}
+                disabled={isPdfExporting || visibleStitchCount === 0}
                 onClick={exportPatternPdf}
               >
                 {isPdfExporting ? (
@@ -5193,7 +5670,7 @@ export default function NeedlepointEditor() {
                   Stitches
                 </dt>
                 <dd className="mt-1 font-mono text-lg text-[#38271d]">
-                  {project.stitches.length}
+                  {visibleStitchCount}
                 </dd>
               </div>
               <div>

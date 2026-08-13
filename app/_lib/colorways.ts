@@ -6,6 +6,7 @@ import type {
   Project,
   ProjectColorState,
 } from "@/app/_lib/needlepointTypes";
+import { getAllStitches } from "@/app/_lib/layers";
 import { deltaE2000, hexToLab, type Lab } from "@/app/_lib/patternCore";
 
 export type CraftColorwayProfile =
@@ -131,7 +132,7 @@ export function buildResolvedRolePalette(
 
 export function getUsedColorRoles(project: Project): UsedColorRole[] {
   const counts = new Map<string, number>();
-  for (const stitch of project.stitches) {
+  for (const stitch of getAllStitches(project)) {
     counts.set(stitch.colorRoleId, (counts.get(stitch.colorRoleId) ?? 0) + 1);
   }
   const paletteMap = buildPaletteMap(project.palette);
@@ -157,7 +158,7 @@ export function getUsedColorRoles(project: Project): UsedColorRole[] {
 export function getUsedResolvedColors(project: Project) {
   const paletteMap = buildPaletteMap(project.palette);
   const usage = new Map<string, { color: PaletteColor; count: number }>();
-  for (const stitch of project.stitches) {
+  for (const stitch of getAllStitches(project)) {
     const colorId = resolveRoleColorId(project, stitch.colorRoleId);
     const color = paletteMap.get(colorId);
     if (!color) continue;

@@ -2,10 +2,10 @@ import { PDFDocument } from "pdf-lib";
 import { describe, expect, it } from "vitest";
 import { generatePatternPdf } from "./patternPdf";
 import type { Project } from "./needlepointTypes";
+import { makeDefaultLayer, makeLayeredProject } from "./layers";
 
 function makeProject(freeform = false): Project {
-  return {
-    version: 2,
+  return makeLayeredProject({
     canvas: {
       cols: 127,
       rows: 169,
@@ -23,34 +23,36 @@ function makeProject(freeform = false): Project {
         source: "dmc",
       },
     ],
-    stitches: [
-      {
-        id: "tent",
-        from: { col: 0, row: 1 },
-        to: { col: 1, row: 0 },
-        colorRoleId: "role-red",
-        thickness: 12,
-        strands: 6,
-      },
-      ...(freeform
-        ? [
-            {
-              id: "freeform",
-              from: { col: 2, row: 3 },
-              to: { col: 18, row: 24 },
-              colorRoleId: "role-red",
-              thickness: 12,
-              strands: 6,
-            },
-          ]
-        : []),
+    layers: [
+      makeDefaultLayer([
+        {
+          id: "tent",
+          from: { col: 0, row: 1 },
+          to: { col: 1, row: 0 },
+          colorRoleId: "role-red",
+          thickness: 12,
+          strands: 6,
+        },
+        ...(freeform
+          ? [
+              {
+                id: "freeform",
+                from: { col: 2, row: 3 },
+                to: { col: 18, row: 24 },
+                colorRoleId: "role-red",
+                thickness: 12,
+                strands: 6,
+              },
+            ]
+          : []),
+      ]),
     ],
     colors: {
       roles: [{ id: "role-red", originalColorId: "dmc-321" }],
       current: {},
       colorways: [],
     },
-  };
+  });
 }
 
 describe("printable pattern PDF", () => {

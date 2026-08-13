@@ -1,4 +1,5 @@
 import type { Hole, Project, Stitch } from "@/app/_lib/needlepointTypes";
+import { getVisibleStitches } from "@/app/_lib/layers";
 
 export const MAX_HOLE_STRAND_UNITS = 18;
 
@@ -26,7 +27,7 @@ function stitchStrands(stitch: Stitch) {
 export function getHoleLoadMap(project: Project) {
   const loadMap = new Map<string, number>();
 
-  for (const stitch of project.stitches) {
+  for (const stitch of getVisibleStitches(project)) {
     const strands = stitchStrands(stitch);
     for (const hole of [stitch.from, stitch.to]) {
       const key = holeKey(hole);

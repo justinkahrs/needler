@@ -5,11 +5,17 @@ import type {
   Project,
   SheetCanvas,
   Stitch,
+  StitchLayer,
 } from "@/app/_lib/needlepointTypes";
+import {
+  makeDefaultLayer,
+  makeLayeredProject,
+} from "@/app/_lib/layers";
 
-export const PROJECT_STORAGE_KEY = "needler.project.v3";
-export const PREVIOUS_PROJECT_STORAGE_KEY = "needler.project.v2";
-export const LEGACY_PROJECT_STORAGE_KEY = "needler.project.v1";
+export const PROJECT_STORAGE_KEY = "needler.project.v4";
+export const PREVIOUS_PROJECT_STORAGE_KEY = "needler.project.v3";
+export const LEGACY_PROJECT_STORAGE_KEY = "needler.project.v2";
+export const OLDEST_PROJECT_STORAGE_KEY = "needler.project.v1";
 
 type StoredStitchV2 = [
   fromCol: number,
@@ -53,10 +59,27 @@ type StoredProjectV3 = {
   stitches: StoredStitchV3[];
 };
 
+type StoredLayerV4 = {
+  id: string;
+  name: string;
+  visible?: boolean;
+  locked?: boolean;
+  stitches: StoredStitchV3[];
+};
+
+type StoredProjectV4 = Omit<StoredProjectV3, "version" | "stitches"> & {
+  version: 4;
+  activeLayerId?: string;
+  layers: StoredLayerV4[];
+};
+
 type LegacyStitch = Omit<Stitch, "colorRoleId"> & { colorId: string };
-type LegacyProjectV1 = Omit<Project, "version" | "colors" | "stitches"> & {
+type LegacyProjectV1 = {
   version: 1;
+  canvas: SheetCanvas;
+  palette: PaletteColor[];
   stitches: LegacyStitch[];
+  colors?: never;
 };
 
 const FIXED_CANVAS: SheetCanvas = {
@@ -155,6 +178,45 @@ function isStoredProjectV3(value: unknown): value is StoredProjectV3 {
   );
 }
 
+function isStoredLayerV4(value: unknown): value is StoredLayerV4 {
+  if (!value || typeof value !== "object") return false;
+  const layer = value as StoredLayerV4;
+  return (
+    typeof layer.id === "string" &&
+    typeof layer.name === "string" &&
+    (layer.visible === undefined || typeof layer.visible === "boolean") &&
+    (layer.locked === undefined || typeof layer.locked === "boolean") &&
+    Array.isArray(layer.stitches) &&
+    layer.stitches.every((stitch) => isNumberTuple(stitch, 6))
+  );
+}
+
+function isStoredProjectV4(value: unknown): value is StoredProjectV4 {
+  if (!value || typeof value !== "object") return false;
+  const project = value as StoredProjectV4;
+  return (
+    project.version === 4 &&
+    Array.isArray(project.palette) &&
+    project.palette.every(isPaletteColor) &&
+    Array.isArray(project.roles) &&
+    project.roles.every(
+      (role) =>
+        Array.isArray(role) &&
+        role.length === 2 &&
+        typeof role[0] === "string" &&
+        Number.isFinite(role[1]),
+    ) &&
+    Array.isArray(project.current) &&
+    project.current.every(isStoredAssignment) &&
+    Array.isArray(project.colorways) &&
+    project.colorways.every(isStoredColorway) &&
+    Array.isArray(project.layers) &&
+    project.layers.every(isStoredLayerV4) &&
+    (project.activeLayerId === undefined || typeof project.activeLayerId === "string") &&
+    (project.activeColorwayId === undefined || typeof project.activeColorwayId === "string")
+  );
+}
+
 function uniqueRoleId(colorId: string, taken: Set<string>) {
   const base = `role-${colorId}`;
   if (!taken.has(base)) {
@@ -191,24 +253,27 @@ function migratePaletteStitches(
 
   for (const color of palette) ensureRole(color.id);
 
-  return {
-    version: 2,
+  return makeLayeredProject({
     canvas: FIXED_CANVAS,
     palette,
-    stitches: stitches.map((stitch) => ({
-      id: stitch.id,
-      from: stitch.from,
-      to: stitch.to,
-      colorRoleId: ensureRole(stitch.colorId).id,
-      thickness: stitch.thickness,
-      strands: stitch.strands,
-    })),
     colors: {
       roles: [...roleByColor.values()],
       current: {},
       colorways: [],
     },
-  };
+    layers: [
+      makeDefaultLayer(
+        stitches.map((stitch) => ({
+          id: stitch.id,
+          from: stitch.from,
+          to: stitch.to,
+          colorRoleId: ensureRole(stitch.colorId).id,
+          thickness: stitch.thickness,
+          strands: stitch.strands,
+        })),
+      ),
+    ],
+  });
 }
 
 function assignmentsFromStored(
@@ -225,18 +290,28 @@ function assignmentsFromStored(
   return result;
 }
 
-function deserializeV3(value: StoredProjectV3): Project {
-  const roles: ColorRole[] = value.roles.flatMap(([id, paletteIndex]) => {
-    const color = value.palette[paletteIndex];
+function rolesFromStored(
+  roles: StoredProjectV3["roles"],
+  palette: PaletteColor[],
+) {
+  return roles.flatMap(([id, paletteIndex]) => {
+    const color = palette[paletteIndex];
     return color ? [{ id, originalColorId: color.id }] : [];
   });
-  const stitches: Stitch[] = value.stitches.flatMap((stored, index) => {
+}
+
+function stitchesFromStored(
+  stitches: StoredStitchV3[],
+  roles: ColorRole[],
+  layerIndex = 0,
+) {
+  return stitches.flatMap((stored, index): Stitch[] => {
     const [fromCol, fromRow, toCol, toRow, roleIndex, strands] = stored;
     const role = roles[roleIndex];
     return role
       ? [
           {
-            id: `saved-${index.toString(36)}`,
+            id: `saved-${layerIndex.toString(36)}-${index.toString(36)}`,
             from: { col: fromCol, row: fromRow },
             to: { col: toCol, row: toRow },
             colorRoleId: role.id,
@@ -246,17 +321,25 @@ function deserializeV3(value: StoredProjectV3): Project {
         ]
       : [];
   });
-  const colorways: Colorway[] = value.colorways.map((colorway) => ({
+}
+
+function colorwaysFromStored(value: Pick<StoredProjectV3, "colorways" | "palette">, roles: ColorRole[]) {
+  return value.colorways.map((colorway) => ({
     id: colorway.id,
     name: colorway.name,
     assignments: assignmentsFromStored(colorway.assignments, roles, value.palette),
   }));
+}
 
-  return {
-    version: 2,
+function deserializeV3(value: StoredProjectV3): Project {
+  const roles = rolesFromStored(value.roles, value.palette);
+  const stitches = stitchesFromStored(value.stitches, roles);
+  const colorways = colorwaysFromStored(value, roles);
+
+  return makeLayeredProject({
     canvas: FIXED_CANVAS,
     palette: value.palette,
-    stitches,
+    layers: [makeDefaultLayer(stitches)],
     colors: {
       roles,
       current: assignmentsFromStored(value.current, roles, value.palette),
@@ -267,7 +350,39 @@ function deserializeV3(value: StoredProjectV3): Project {
         ? value.activeColorwayId
         : undefined,
     },
-  };
+  });
+}
+
+function deserializeV4(value: StoredProjectV4): Project {
+  const roles: ColorRole[] = value.roles.flatMap(([id, paletteIndex]) => {
+    const color = value.palette[paletteIndex];
+    return color ? [{ id, originalColorId: color.id }] : [];
+  });
+  const layers: StitchLayer[] = value.layers.map((layer, index) => ({
+    id: layer.id,
+    name: layer.name,
+    visible: layer.visible ?? true,
+    locked: layer.locked ?? false,
+    stitches: stitchesFromStored(layer.stitches, roles, index),
+  }));
+  const colorways: Colorway[] = colorwaysFromStored(value, roles);
+
+  return makeLayeredProject({
+    canvas: FIXED_CANVAS,
+    palette: value.palette,
+    layers,
+    activeLayerId: value.activeLayerId,
+    colors: {
+      roles,
+      current: assignmentsFromStored(value.current, roles, value.palette),
+      colorways,
+      activeColorwayId: colorways.some(
+        (colorway) => colorway.id === value.activeColorwayId,
+      )
+        ? value.activeColorwayId
+        : undefined,
+    },
+  });
 }
 
 export function serializeProject(project: Project) {
@@ -285,7 +400,8 @@ export function serializeProject(project: Project) {
         ? []
         : [[storedRole, storedColor] as StoredAssignment];
     });
-  const stitches: StoredStitchV3[] = project.stitches.flatMap((stitch) => {
+  const serializeStitches = (stitches: Stitch[]) =>
+    stitches.flatMap((stitch): StoredStitchV3[] => {
     const storedRole = roleIndex.get(stitch.colorRoleId);
     return storedRole === undefined
       ? []
@@ -299,10 +415,10 @@ export function serializeProject(project: Project) {
             stitch.strands ?? 6,
           ],
         ];
-  });
+    });
 
   return JSON.stringify({
-    version: 3,
+    version: 4,
     palette: project.palette,
     roles,
     current: serializeAssignments(project.colors.current),
@@ -312,11 +428,19 @@ export function serializeProject(project: Project) {
       assignments: serializeAssignments(colorway.assignments),
     })),
     activeColorwayId: project.colors.activeColorwayId,
-    stitches,
-  } satisfies StoredProjectV3);
+    activeLayerId: project.activeLayerId,
+    layers: project.layers.map((layer) => ({
+      id: layer.id,
+      name: layer.name,
+      visible: layer.visible,
+      locked: layer.locked,
+      stitches: serializeStitches(layer.stitches),
+    })),
+  } satisfies StoredProjectV4);
 }
 
 export function deserializeProject(value: unknown): Project | null {
+  if (isStoredProjectV4(value)) return deserializeV4(value);
   if (isStoredProjectV3(value)) return deserializeV3(value);
   if (isLegacyProject(value)) {
     return migratePaletteStitches(value.palette, value.stitches);

@@ -12,6 +12,7 @@ import type {
   Stitch,
 } from "@/app/_lib/needlepointTypes";
 import { resolveRoleColorId } from "@/app/_lib/colorways";
+import { getVisibleStitches } from "@/app/_lib/layers";
 
 export type PatternPdfProgress = {
   stage: "preparing" | "cover" | "legend" | "charts" | "exceptions" | "saving";
@@ -82,7 +83,7 @@ function buildChartData(project: Project): ChartData {
   >();
   const exceptions: ExceptionStitch[] = [];
 
-  for (const stitch of project.stitches) {
+  for (const stitch of getVisibleStitches(project)) {
     const unitCell = unitCellForStitch(stitch);
     const colorId = resolveRoleColorId(project, stitch.colorRoleId);
     if (!unitCell) {
@@ -139,7 +140,7 @@ function getUsedColors(project: Project) {
     { color: PaletteColor; count: number; strands: Set<number> }
   >();
 
-  for (const stitch of project.stitches) {
+  for (const stitch of getVisibleStitches(project)) {
     const color = paletteMap.get(resolveRoleColorId(project, stitch.colorRoleId));
     if (!color) continue;
     const current = usage.get(color.id) ?? {
@@ -255,7 +256,7 @@ function drawCover(
   const infoX = previewX + previewWidth + 32;
   let infoY = height - 145;
   const infoRows = [
-    ["Stitches", project.stitches.length.toLocaleString()],
+    ["Stitches", getVisibleStitches(project).length.toLocaleString()],
     ["Thread colors", usedColors.length.toString()],
     ["Chart pages", "12"],
     ["Freeform exceptions", chartData.exceptions.length.toString()],

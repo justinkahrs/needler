@@ -13,6 +13,10 @@ import {
 } from "lucide-react";
 import type { Project } from "@/app/_lib/needlepointTypes";
 import {
+  getAllStitchCount,
+  getVisibleStitchCount,
+} from "@/app/_lib/layers";
+import {
   NEEDLER_FILE_EXTENSION,
   PRACTICAL_SHARE_URL_LIMIT,
   ShareProjectError,
@@ -105,6 +109,8 @@ export default function ShareProjectPanel({
   const [copied, setCopied] = useState(false);
   const [openingFile, setOpeningFile] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const visibleStitchCount = getVisibleStitchCount(project);
+  const allStitchCount = getAllStitchCount(project);
 
   const prepareProject = async () => {
     if (
@@ -238,8 +244,11 @@ export default function ShareProjectPanel({
             Share Project
           </h2>
           <p className="mt-0.5 truncate text-xs text-[#8a6c55]">
-            {project.stitches.length.toLocaleString()}{" "}
-            {project.stitches.length === 1 ? "stitch" : "stitches"}
+            {visibleStitchCount.toLocaleString()} visible{" "}
+            {visibleStitchCount === 1 ? "stitch" : "stitches"}
+            {allStitchCount !== visibleStitchCount
+              ? `, ${allStitchCount.toLocaleString()} total`
+              : ""}
           </p>
         </div>
         {onCollapse ? (
