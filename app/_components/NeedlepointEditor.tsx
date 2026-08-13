@@ -13,6 +13,10 @@ import {
   Minus,
   Move,
   Palette,
+  PanelLeftClose,
+  PanelLeftOpen,
+  PanelRightClose,
+  PanelRightOpen,
   Pipette,
   Plus,
   Redo2,
@@ -70,6 +74,23 @@ import type {
   Stitch,
 } from "@/app/_lib/needlepointTypes";
 import {
+  applyViewportGesture,
+  classifyReferenceGesture,
+  degreesToRadians,
+  distanceBetween,
+  getDoubleTapView,
+  getGestureFrame,
+  normalizeViewRotation,
+  screenToWorldPoint,
+  zoomViewAtPoint,
+} from "@/app/_lib/gestureView";
+import type {
+  GestureFrame,
+  GesturePoint as Point,
+  GestureViewState as ViewState,
+  ReferenceGestureIntent,
+} from "@/app/_lib/gestureView";
+import {
   useCallback,
   useEffect,
   useMemo,
@@ -80,8 +101,6 @@ import {
 import type { ReactNode } from "react";
 
 type Tool = "stitch" | "erase" | "pan" | "image" | "eyedropper";
-type Point = { x: number; y: number };
-type ViewState = { zoom: number; pan: Point; rotation: number };
 type ReferenceImageState = {
   src: string;
   name: string;
@@ -108,6 +127,28 @@ type ImageDragState =
       origin: Point;
     }
   | null;
+type StagePointer = {
+  pointerId: number;
+  pointerType: string;
+  point: Point;
+};
+type StageGestureSession = {
+  startFrame: GestureFrame;
+  startView: ViewState;
+  intent: ReferenceGestureIntent;
+  startReference:
+    | {
+        scale: number;
+        translateX: number;
+        translateY: number;
+      }
+    | null;
+};
+type StageTapCandidate = {
+  pointerId: number;
+  start: Point;
+  moved: boolean;
+};
 type NoticeTone = "info" | "warn" | "success";
 type Notice = { id: number; message: string; tone: NoticeTone };
 type PatternJobState =
@@ -148,6 +189,11 @@ const DISPLAY_PIXELS_PER_INCH = 252;
 const DMC_STRAND_DIAMETER_INCH = 0.0265;
 const MIN_ZOOM = 0.12;
 const MAX_ZOOM = 2.7;
+const REFERENCE_MIN_SCALE = 0.25;
+const REFERENCE_MAX_SCALE = 4;
+const DOUBLE_TAP_MAX_DELAY_MS = 320;
+const DOUBLE_TAP_MAX_DISTANCE = 34;
+const TAP_MOVE_TOLERANCE = 8;
 const EXPORT_SCALE = 3;
 const PATTERN_SAMPLE_SCALE = 4;
 const DEFAULT_PATTERN_SETTINGS: PatternSettings = {
@@ -434,16 +480,6 @@ function holeToWorld(hole: Hole, canvas: Project["canvas"]): Point {
   };
 }
 
-function degreesToRadians(degrees: number) {
-  return (degrees * Math.PI) / 180;
-}
-
-function normalizeRotation(degrees: number) {
-  const normalized = ((degrees % 360) + 360) % 360;
-
-  return normalized > 180 ? normalized - 360 : normalized;
-}
-
 function getRotatedWorldBounds(canvas: Project["canvas"], rotation: number) {
   const world = getWorldSize(canvas);
   const radians = degreesToRadians(rotation);
@@ -474,33 +510,7 @@ function screenToWorld(
   view: ViewState,
   canvas: Project["canvas"],
 ): Point {
-  const center = getWorldCenter(canvas);
-  const radians = degreesToRadians(-view.rotation);
-  const dx = point.x - view.pan.x;
-  const dy = point.y - view.pan.y;
-  const rotatedX = dx * Math.cos(radians) - dy * Math.sin(radians);
-  const rotatedY = dx * Math.sin(radians) + dy * Math.cos(radians);
-
-  return {
-    x: rotatedX / view.zoom + center.x,
-    y: rotatedY / view.zoom + center.y,
-  };
-}
-
-function worldToScreen(
-  point: Point,
-  view: ViewState,
-  canvas: Project["canvas"],
-): Point {
-  const center = getWorldCenter(canvas);
-  const radians = degreesToRadians(view.rotation);
-  const dx = (point.x - center.x) * view.zoom;
-  const dy = (point.y - center.y) * view.zoom;
-
-  return {
-    x: view.pan.x + dx * Math.cos(radians) - dy * Math.sin(radians),
-    y: view.pan.y + dx * Math.sin(radians) + dy * Math.cos(radians),
-  };
+  return screenToWorldPoint(point, view, getWorldCenter(canvas));
 }
 
 function nearestHole(point: Point, canvas: Project["canvas"]): Hole | null {
@@ -1500,6 +1510,55 @@ function NeedleIcon({
   );
 }
 
+function getToolLabel(tool: Tool) {
+  switch (tool) {
+    case "stitch":
+      return "Stitch";
+    case "erase":
+      return "Erase";
+    case "pan":
+      return "Pan";
+    case "image":
+      return "Image";
+    case "eyedropper":
+      return "Eyedropper";
+  }
+}
+
+function getPanelLabel(mode: RightPanelMode) {
+  switch (mode) {
+    case "inspector":
+      return "Inspector";
+    case "colorways":
+      return "Colorways";
+    case "share":
+      return "Share";
+  }
+}
+
+function ToolGlyph({
+  tool,
+  size = 18,
+  strokeWidth = 1.8,
+}: {
+  tool: Tool;
+  size?: number;
+  strokeWidth?: number;
+}) {
+  switch (tool) {
+    case "stitch":
+      return <NeedleIcon size={size} strokeWidth={strokeWidth} />;
+    case "erase":
+      return <Eraser size={size} strokeWidth={strokeWidth} />;
+    case "pan":
+      return <Move size={size} strokeWidth={strokeWidth} />;
+    case "image":
+      return <Crop size={size} strokeWidth={strokeWidth} />;
+    case "eyedropper":
+      return <Pipette size={size} strokeWidth={strokeWidth} />;
+  }
+}
+
 function IconButton({
   label,
   active,
@@ -1569,6 +1628,8 @@ export default function NeedlepointEditor() {
   const [pdfJob, setPdfJob] = useState<PdfJobState>({ status: "idle" });
   const [rightPanelMode, setRightPanelMode] =
     useState<RightPanelMode>("inspector");
+  const [toolRailCollapsed, setToolRailCollapsed] = useState(false);
+  const [panelCollapsed, setPanelCollapsed] = useState(false);
   const [initialColorwayRoleId, setInitialColorwayRoleId] = useState<
     string | undefined
   >();
@@ -1591,6 +1652,10 @@ export default function NeedlepointEditor() {
   const localWorkspaceRef = useRef<{ project: Project; rotation: number } | null>(
     null,
   );
+  const activePointersRef = useRef<Map<number, StagePointer>>(new Map());
+  const gestureSessionRef = useRef<StageGestureSession | null>(null);
+  const tapCandidateRef = useRef<StageTapCandidate | null>(null);
+  const lastTapRef = useRef<{ point: Point; time: number } | null>(null);
 
   const meshCount = getMeshCount(project.canvas);
   const physicalWidth = project.canvas.widthIn;
@@ -1664,6 +1729,7 @@ export default function NeedlepointEditor() {
       return;
     }
     setInitialColorwayRoleId(roleId);
+    setPanelCollapsed(false);
     setRightPanelMode("colorways");
   };
 
@@ -1680,6 +1746,7 @@ export default function NeedlepointEditor() {
     }
     setColorwayPreview(null);
     setInitialColorwayRoleId(undefined);
+    setPanelCollapsed(false);
     setRightPanelMode("share");
   };
 
@@ -1691,10 +1758,9 @@ export default function NeedlepointEditor() {
     notify(message, "success");
   };
 
-  const fitViewToCanvas = useCallback((canvas: Project["canvas"], rotation?: number) => {
-    setView((current) => {
-      const nextRotation = rotation ?? current.rotation;
-      const nextWorld = getRotatedWorldBounds(canvas, nextRotation);
+  const getFittedView = useCallback(
+    (canvas: Project["canvas"], rotation: number): ViewState => {
+      const nextWorld = getRotatedWorldBounds(canvas, rotation);
       const zoom = clamp(
         Math.min(
           Math.max(1, viewport.x - 48) / nextWorld.width,
@@ -1710,10 +1776,20 @@ export default function NeedlepointEditor() {
           x: viewport.x / 2,
           y: viewport.y / 2,
         },
-        rotation: nextRotation,
+        rotation,
       };
-    });
-  }, [viewport]);
+    },
+    [viewport],
+  );
+
+  const fitViewToCanvas = useCallback(
+    (canvas: Project["canvas"], rotation?: number) => {
+      setView((current) =>
+        getFittedView(canvas, rotation ?? current.rotation),
+      );
+    },
+    [getFittedView],
+  );
 
   const fitView = useCallback(() => {
     fitViewToCanvas(project.canvas);
@@ -1721,18 +1797,14 @@ export default function NeedlepointEditor() {
 
   const zoomAt = useCallback((screenPoint: Point, zoomFactor: number) => {
     setView((current) => {
-      const nextZoom = clamp(current.zoom * zoomFactor, MIN_ZOOM, MAX_ZOOM);
-      const worldPoint = screenToWorld(screenPoint, current, project.canvas);
-      const nextView = { ...current, zoom: nextZoom };
-      const nextScreenPoint = worldToScreen(worldPoint, nextView, project.canvas);
-
-      return {
-        ...nextView,
-        pan: {
-          x: current.pan.x + screenPoint.x - nextScreenPoint.x,
-          y: current.pan.y + screenPoint.y - nextScreenPoint.y,
-        },
-      };
+      return zoomViewAtPoint({
+        view: current,
+        screenPoint,
+        nextZoom: current.zoom * zoomFactor,
+        center: getWorldCenter(project.canvas),
+        minZoom: MIN_ZOOM,
+        maxZoom: MAX_ZOOM,
+      });
     });
   }, [project.canvas]);
 
@@ -2098,6 +2170,202 @@ export default function NeedlepointEditor() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
+  const registerStageTap = (screenPoint: Point, timestamp: number) => {
+    const previous = lastTapRef.current;
+
+    if (
+      previous &&
+      timestamp - previous.time <= DOUBLE_TAP_MAX_DELAY_MS &&
+      distanceBetween(previous.point, screenPoint) <= DOUBLE_TAP_MAX_DISTANCE
+    ) {
+      lastTapRef.current = null;
+      setView((current) => {
+        const fitView = getFittedView(project.canvas, current.rotation);
+        const workingZoom = Math.max(fitView.zoom * 2.35, 0.9);
+
+        return getDoubleTapView({
+          view: current,
+          screenPoint,
+          center: getWorldCenter(project.canvas),
+          fitView,
+          workingZoom,
+          minZoom: MIN_ZOOM,
+          maxZoom: MAX_ZOOM,
+        });
+      });
+      return true;
+    }
+
+    lastTapRef.current = { point: screenPoint, time: timestamp };
+    return false;
+  };
+
+  const clearPendingStageEdits = () => {
+    setDrag(null);
+    setPanDrag(null);
+    setImageDrag(null);
+    setHoverHole(null);
+    setHoveredStitchId(null);
+    tapCandidateRef.current = null;
+  };
+
+  const getStageGesturePointers = (): [StagePointer, StagePointer] | null => {
+    const pointers = [...activePointersRef.current.values()];
+
+    if (pointers.length < 2) {
+      return null;
+    }
+
+    const touchPointers = pointers.filter(
+      (pointer) => pointer.pointerType === "touch",
+    );
+    const candidates = touchPointers.length >= 2 ? touchPointers : pointers;
+
+    return [candidates[0], candidates[1]];
+  };
+
+  const startStageGesture = () => {
+    const pointers = getStageGesturePointers();
+
+    if (!pointers) {
+      return false;
+    }
+
+    clearPendingStageEdits();
+    gestureSessionRef.current = {
+      startFrame: getGestureFrame(pointers[0].point, pointers[1].point),
+      startView: view,
+      intent: tool === "image" && referenceImage ? "pending" : "viewport",
+      startReference: referenceImage
+        ? {
+            scale: referenceImage.transform.scale,
+            translateX: referenceImage.transform.translateX,
+            translateY: referenceImage.transform.translateY,
+          }
+        : null,
+    };
+
+    return true;
+  };
+
+  const scaleReferenceImageFromGesture = (
+    session: StageGestureSession,
+    currentFrame: GestureFrame,
+  ) => {
+    if (!session.startReference) {
+      return;
+    }
+
+    const bounds = getPatternBounds(project.canvas);
+    const boundsCenter = {
+      x: bounds.x + bounds.width / 2,
+      y: bounds.y + bounds.height / 2,
+    };
+    const startScale = session.startReference.scale || 1;
+    const nextScale = clamp(
+      startScale * (currentFrame.distance / session.startFrame.distance),
+      REFERENCE_MIN_SCALE,
+      REFERENCE_MAX_SCALE,
+    );
+    const scaleRatio = nextScale / startScale;
+    const focalPoint = screenToWorld(
+      session.startFrame.centroid,
+      session.startView,
+      project.canvas,
+    );
+    const startCenter = {
+      x: boundsCenter.x + session.startReference.translateX * bounds.width,
+      y: boundsCenter.y + session.startReference.translateY * bounds.height,
+    };
+    const nextCenter = {
+      x: focalPoint.x + (startCenter.x - focalPoint.x) * scaleRatio,
+      y: focalPoint.y + (startCenter.y - focalPoint.y) * scaleRatio,
+    };
+
+    setReferenceImage((current) =>
+      current
+        ? {
+            ...current,
+            transform: {
+              ...current.transform,
+              scale: nextScale,
+              translateX: (nextCenter.x - boundsCenter.x) / bounds.width,
+              translateY: (nextCenter.y - boundsCenter.y) / bounds.height,
+            },
+          }
+        : current,
+    );
+    setPatternDraft(null);
+    setReplaceConfirmed(false);
+  };
+
+  const updateStageGesture = () => {
+    const session = gestureSessionRef.current;
+    const pointers = getStageGesturePointers();
+
+    if (!session || !pointers) {
+      return false;
+    }
+
+    const currentFrame = getGestureFrame(pointers[0].point, pointers[1].point);
+    let intent = session.intent;
+
+    if (intent === "pending") {
+      intent = classifyReferenceGesture({
+        startFrame: session.startFrame,
+        currentFrame,
+      });
+      session.intent = intent;
+
+      if (intent === "pending") {
+        return true;
+      }
+    }
+
+    if (intent === "image-scale" && tool === "image" && referenceImage) {
+      scaleReferenceImageFromGesture(session, currentFrame);
+      return true;
+    }
+
+    setView(
+      applyViewportGesture({
+        startView: session.startView,
+        startFrame: session.startFrame,
+        currentFrame,
+        center: getWorldCenter(project.canvas),
+        minZoom: MIN_ZOOM,
+        maxZoom: MAX_ZOOM,
+      }),
+    );
+    return true;
+  };
+
+  const releaseStagePointer = (
+    event: React.PointerEvent<HTMLDivElement>,
+  ) => {
+    const hadGesture = Boolean(gestureSessionRef.current);
+
+    activePointersRef.current.delete(event.pointerId);
+    if (tapCandidateRef.current?.pointerId === event.pointerId) {
+      tapCandidateRef.current = null;
+    }
+
+    try {
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+    } catch {
+      // Some browsers throw if capture was already released.
+    }
+
+    if (hadGesture && activePointersRef.current.size < 2) {
+      gestureSessionRef.current = null;
+      return true;
+    }
+
+    return hadGesture;
+  };
+
   const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) {
       return;
@@ -2109,7 +2377,25 @@ export default function NeedlepointEditor() {
       return;
     }
 
+    event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
+    activePointersRef.current.set(event.pointerId, {
+      pointerId: event.pointerId,
+      pointerType: event.pointerType || "mouse",
+      point: screenPoint,
+    });
+
+    if (activePointersRef.current.size >= 2) {
+      startStageGesture();
+      return;
+    }
+
+    gestureSessionRef.current = null;
+    tapCandidateRef.current = {
+      pointerId: event.pointerId,
+      start: screenPoint,
+      moved: false,
+    };
 
     if (tool === "pan") {
       setPanDrag({
@@ -2192,6 +2478,37 @@ export default function NeedlepointEditor() {
       return;
     }
 
+    const activePointer = activePointersRef.current.get(event.pointerId);
+    if (activePointer) {
+      event.preventDefault();
+      activePointersRef.current.set(event.pointerId, {
+        ...activePointer,
+        point: screenPoint,
+      });
+
+      if (
+        tapCandidateRef.current?.pointerId === event.pointerId &&
+        distanceBetween(tapCandidateRef.current.start, screenPoint) >
+          TAP_MOVE_TOLERANCE
+      ) {
+        tapCandidateRef.current = {
+          ...tapCandidateRef.current,
+          moved: true,
+        };
+      }
+    }
+
+    if (
+      gestureSessionRef.current ||
+      activePointersRef.current.size >= 2
+    ) {
+      if (!gestureSessionRef.current) {
+        startStageGesture();
+      }
+      updateStageGesture();
+      return;
+    }
+
     if (panDrag && panDrag.pointerId === event.pointerId) {
       setView((current) => ({
         ...current,
@@ -2241,13 +2558,34 @@ export default function NeedlepointEditor() {
   };
 
   const handlePointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
+    const screenPoint = getClientPoint(event, stageRef.current);
+    const wasTapCandidate =
+      tapCandidateRef.current?.pointerId === event.pointerId &&
+      !tapCandidateRef.current.moved;
+    const handledGesture = releaseStagePointer(event);
+
+    if (handledGesture) {
+      event.preventDefault();
+      return;
+    }
+
+    if (screenPoint) {
+      event.preventDefault();
+    }
+
     if (panDrag?.pointerId === event.pointerId) {
       setPanDrag(null);
+      if (wasTapCandidate && screenPoint) {
+        registerStageTap(screenPoint, event.timeStamp);
+      }
       return;
     }
 
     if (imageDrag?.pointerId === event.pointerId) {
       setImageDrag(null);
+      if (wasTapCandidate && screenPoint) {
+        registerStageTap(screenPoint, event.timeStamp);
+      }
       return;
     }
 
@@ -2255,7 +2593,6 @@ export default function NeedlepointEditor() {
       return;
     }
 
-    const screenPoint = getClientPoint(event, stageRef.current);
     const destination =
       screenPoint
         ? nearestHole(screenToWorld(screenPoint, view, project.canvas), project.canvas)
@@ -2264,6 +2601,10 @@ export default function NeedlepointEditor() {
     setDrag(null);
 
     if (!destination || sameHole(drag.from, destination)) {
+      if (wasTapCandidate && screenPoint) {
+        registerStageTap(screenPoint, event.timeStamp);
+        return;
+      }
       notify("Choose a different destination hole.", "warn");
       return;
     }
@@ -2288,7 +2629,21 @@ export default function NeedlepointEditor() {
     });
   };
 
-  const handleWheel = (event: React.WheelEvent<HTMLDivElement>) => {
+  const handlePointerCancel = (event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    activePointersRef.current.delete(event.pointerId);
+    if (activePointersRef.current.size < 2) {
+      gestureSessionRef.current = null;
+    }
+    if (tapCandidateRef.current?.pointerId === event.pointerId) {
+      tapCandidateRef.current = null;
+    }
+    setDrag(null);
+    setPanDrag(null);
+    setImageDrag(null);
+  };
+
+  const handleWheel = useCallback((event: WheelEvent) => {
     event.preventDefault();
 
     if (tool === "image" && referenceImage) {
@@ -2301,7 +2656,11 @@ export default function NeedlepointEditor() {
               ...current,
               transform: {
                 ...current.transform,
-                scale: clamp(current.transform.scale * factor, 0.25, 4),
+                scale: clamp(
+                  current.transform.scale * factor,
+                  REFERENCE_MIN_SCALE,
+                  REFERENCE_MAX_SCALE,
+                ),
               },
             }
           : current,
@@ -2316,7 +2675,19 @@ export default function NeedlepointEditor() {
     }
 
     zoomAt(screenPoint, event.deltaY > 0 ? 0.9 : 1.1);
-  };
+  }, [referenceImage, tool, zoomAt]);
+
+  useEffect(() => {
+    const stage = stageRef.current;
+
+    if (!stage) {
+      return;
+    }
+
+    stage.addEventListener("wheel", handleWheel, { passive: false });
+
+    return () => stage.removeEventListener("wheel", handleWheel);
+  }, [handleWheel]);
 
   const addDmcColor = (color: DmcColor) => {
     const paletteColor = paletteColorFromDmc(color);
@@ -2492,14 +2863,14 @@ export default function NeedlepointEditor() {
   const rotateViewBy = (degrees: number) => {
     setView((current) => ({
       ...current,
-      rotation: normalizeRotation(current.rotation + degrees),
+      rotation: normalizeViewRotation(current.rotation + degrees),
     }));
   };
 
   const changeViewRotation = (degrees: number) => {
     setView((current) => ({
       ...current,
-      rotation: normalizeRotation(degrees),
+      rotation: normalizeViewRotation(degrees),
     }));
   };
 
@@ -2792,10 +3163,52 @@ export default function NeedlepointEditor() {
     setReplaceConfirmed(false);
   };
 
+  const activeToolLabel = getToolLabel(tool);
+  const activePanelLabel = getPanelLabel(rightPanelMode);
+  const workspaceGridClass = [
+    "mx-auto grid min-h-[100dvh] w-full max-w-[1800px] grid-cols-1 gap-3 px-2 py-2 md:px-3 md:py-3 xl:px-4 xl:py-4",
+    toolRailCollapsed && panelCollapsed
+      ? "xl:grid-cols-[48px_minmax(0,1fr)_48px]"
+      : toolRailCollapsed
+        ? "xl:grid-cols-[48px_minmax(0,1fr)_330px]"
+        : panelCollapsed
+          ? "xl:grid-cols-[72px_minmax(0,1fr)_48px]"
+          : "xl:grid-cols-[72px_minmax(0,1fr)_330px]",
+  ].join(" ");
+  const toolRailClass = [
+    "order-2 flex items-center gap-2 overflow-x-auto rounded-lg border border-[#d6bfa6] bg-[#ead9c4]/78 p-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.52)] xl:order-1 xl:flex-col xl:overflow-visible",
+    toolRailCollapsed ? "justify-between xl:w-12 xl:px-1" : "",
+  ].join(" ");
+  const stagePanelClass =
+    "order-1 flex min-h-[clamp(600px,78dvh,960px)] min-w-0 flex-col rounded-lg border border-[#cfb69c] bg-[#f8f0e5] shadow-[0_20px_44px_-28px_rgba(87,55,35,0.36)] md:min-h-[clamp(680px,80dvh,1040px)] xl:order-2 xl:min-h-[calc(100dvh-2rem)]";
+
   return (
     <main className="min-h-[100dvh] bg-[#f3ebdf] text-[#38271d]">
-      <div className="mx-auto grid min-h-[100dvh] w-full max-w-[1500px] grid-cols-1 gap-4 px-4 py-4 lg:grid-cols-[72px_minmax(0,1fr)_330px] lg:px-5">
-        <aside className="order-2 flex items-center gap-2 overflow-x-auto rounded-lg border border-[#d6bfa6] bg-[#ead9c4]/78 p-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.52)] lg:order-1 lg:flex-col lg:overflow-visible">
+      <div className={workspaceGridClass}>
+        <aside className={toolRailClass}>
+          <IconButton
+            label={toolRailCollapsed ? "Show tools" : "Collapse tools"}
+            onClick={() => setToolRailCollapsed((current) => !current)}
+          >
+            {toolRailCollapsed ? (
+              <PanelLeftOpen size={18} strokeWidth={1.8} />
+            ) : (
+              <PanelLeftClose size={18} strokeWidth={1.8} />
+            )}
+          </IconButton>
+          {toolRailCollapsed ? (
+            <button
+              type="button"
+              aria-label={`Active tool: ${activeToolLabel}`}
+              title={`Active tool: ${activeToolLabel}`}
+              className="flex h-11 min-w-11 items-center justify-center gap-2 rounded-md border border-[#7e4e36] bg-[#7e4e36] px-2 text-sm font-medium text-[#fff9f0] shadow-[inset_0_1px_0_rgba(255,255,255,0.18)]"
+              onClick={() => setToolRailCollapsed(false)}
+            >
+              <ToolGlyph tool={tool} size={18} strokeWidth={1.8} />
+              <span className="md:inline xl:hidden">{activeToolLabel}</span>
+            </button>
+          ) : (
+            <>
           <IconButton
             label="Stitch tool"
             active={tool === "stitch"}
@@ -2888,9 +3301,11 @@ export default function NeedlepointEditor() {
           <IconButton label="Reset sheet" onClick={resetProject}>
             <RotateCcw size={18} strokeWidth={1.8} />
           </IconButton>
+            </>
+          )}
         </aside>
 
-        <section className="order-1 flex min-h-[66dvh] min-w-0 flex-col rounded-lg border border-[#cfb69c] bg-[#f8f0e5] shadow-[0_20px_44px_-28px_rgba(87,55,35,0.36)] lg:order-2 lg:min-h-0">
+        <section className={stagePanelClass}>
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#dec9b1] px-4 py-3">
             <div className="min-w-0">
               <h1 className="text-xl font-semibold tracking-tight text-[#332419]">
@@ -2946,7 +3361,7 @@ export default function NeedlepointEditor() {
           <div
             ref={stageRef}
             className={[
-              "relative min-h-[560px] flex-1 overflow-hidden bg-[#d6bd9f] touch-none lg:min-h-0",
+              "relative min-h-[clamp(520px,72dvh,880px)] flex-1 select-none overflow-hidden overscroll-contain bg-[#d6bd9f] touch-none xl:min-h-0",
               tool === "image"
                 ? imageDrag
                   ? "cursor-grabbing"
@@ -2964,19 +3379,17 @@ export default function NeedlepointEditor() {
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
             onPointerUp={handlePointerUp}
-            onPointerCancel={() => {
-              setDrag(null);
-              setPanDrag(null);
-              setImageDrag(null);
-            }}
-            onWheel={handleWheel}
+            onPointerCancel={handlePointerCancel}
           >
             <div className="absolute inset-0 bg-[radial-gradient(circle_at_20%_18%,rgba(255,255,255,0.34),transparent_28%),linear-gradient(135deg,#dec4a4,#c59d75)]" />
             <canvas ref={baseCanvasRef} className="absolute inset-0" />
             <canvas ref={stitchCanvasRef} className="absolute inset-0" />
             <canvas ref={previewCanvasRef} className="absolute inset-0" />
             {patternJob.status === "working" ? (
-              <div className="pointer-events-none absolute left-1/2 top-4 w-[min(320px,calc(100%-32px))] -translate-x-1/2 rounded-md border border-[#d6bfa6] bg-[#fff8ef]/94 px-3 py-3 shadow-[0_14px_28px_-22px_rgba(58,35,22,0.5)]">
+              <div
+                className="pointer-events-none absolute left-1/2 w-[min(320px,calc(100%-24px))] -translate-x-1/2 rounded-md border border-[#d6bfa6] bg-[#fff8ef]/94 px-3 py-3 shadow-[0_14px_28px_-22px_rgba(58,35,22,0.5)]"
+                style={{ top: "max(0.75rem, env(safe-area-inset-top))" }}
+              >
                 <div className="flex items-center justify-between gap-3 text-xs font-medium uppercase tracking-[0.08em] text-[#765943]">
                   <span>{patternJob.progress.stage}</span>
                   <span className="font-mono">{patternJob.progress.percent}%</span>
@@ -2990,25 +3403,41 @@ export default function NeedlepointEditor() {
               </div>
             ) : null}
             {project.stitches.length === 0 ? (
-              <div className="pointer-events-none absolute left-4 top-4 max-w-[230px] rounded-md border border-[#e2cbb2] bg-[#fff8ef]/88 px-3 py-2 text-sm text-[#765943] shadow-[0_12px_30px_-24px_rgba(58,35,22,0.42)]">
+              <div
+                className="pointer-events-none absolute max-w-[230px] rounded-md border border-[#e2cbb2] bg-[#fff8ef]/88 px-3 py-2 text-sm text-[#765943] shadow-[0_12px_30px_-24px_rgba(58,35,22,0.42)]"
+                style={{
+                  left: "max(0.75rem, env(safe-area-inset-left))",
+                  top: "max(0.75rem, env(safe-area-inset-top))",
+                }}
+              >
                 No stitches yet
               </div>
             ) : null}
             {notice ? (
               <div
                 className={[
-                  "pointer-events-none absolute bottom-4 left-4 max-w-[280px] rounded-md border px-3 py-2 text-sm font-medium shadow-[0_12px_30px_-22px_rgba(58,35,22,0.48)]",
+                  "pointer-events-none absolute w-[min(280px,calc(100%-24px))] rounded-md border px-3 py-2 text-sm font-medium shadow-[0_12px_30px_-22px_rgba(58,35,22,0.48)]",
                   notice.tone === "warn"
                     ? "border-[#cfa098] bg-[#fff3ef] text-[#8a332c]"
                     : notice.tone === "success"
                       ? "border-[#b8c59e] bg-[#f4f8ed] text-[#536842]"
                       : "border-[#e2cbb2] bg-[#fff8ef] text-[#765943]",
                 ].join(" ")}
+                style={{
+                  bottom: "max(0.75rem, env(safe-area-inset-bottom))",
+                  left: "max(0.75rem, env(safe-area-inset-left))",
+                }}
               >
                 {notice.message}
               </div>
             ) : null}
-            <div className="pointer-events-none absolute right-4 top-4 grid gap-1 rounded-md border border-[#e2cbb2] bg-[#fff8ef]/88 px-3 py-2 text-right font-mono text-xs text-[#765943]">
+            <div
+              className="pointer-events-none absolute grid gap-1 rounded-md border border-[#e2cbb2] bg-[#fff8ef]/88 px-3 py-2 text-right font-mono text-xs text-[#765943]"
+              style={{
+                right: "max(0.75rem, env(safe-area-inset-right))",
+                top: "max(0.75rem, env(safe-area-inset-top))",
+              }}
+            >
               <span>{Math.round(view.zoom * 100)}%</span>
               <span>{Math.round(view.rotation)} deg</span>
             </div>
@@ -3022,6 +3451,9 @@ export default function NeedlepointEditor() {
             onPreview={handleColorwayPreview}
             onCommit={commitColorwayProject}
             onClose={closeColorwayStudio}
+            onCollapse={() => setPanelCollapsed(true)}
+            onExpand={() => setPanelCollapsed(false)}
+            collapsed={panelCollapsed}
           />
         ) : rightPanelMode === "share" ? (
           <ShareProjectPanel
@@ -3030,9 +3462,41 @@ export default function NeedlepointEditor() {
             onOpenProject={openTemporaryProject}
             onNotify={notify}
             onClose={() => setRightPanelMode("inspector")}
+            onCollapse={() => setPanelCollapsed(true)}
+            onExpand={() => setPanelCollapsed(false)}
+            collapsed={panelCollapsed}
           />
+        ) : panelCollapsed ? (
+          <aside className="order-3 flex items-center justify-between gap-2 rounded-lg border border-[#d6bfa6] bg-[#fff8ef] p-2 shadow-[0_20px_44px_-30px_rgba(87,55,35,0.32)] xl:min-h-[calc(100dvh-2rem)] xl:flex-col xl:justify-start xl:px-1">
+            <button
+              type="button"
+              aria-label={`Show ${activePanelLabel} panel`}
+              title={`Show ${activePanelLabel} panel`}
+              className="flex h-11 w-11 shrink-0 items-center justify-center rounded-md border border-[#7e4e36] bg-[#7e4e36] text-[#fff9f0] transition active:translate-y-px"
+              onClick={() => setPanelCollapsed(false)}
+            >
+              <PanelRightOpen size={18} strokeWidth={1.8} />
+            </button>
+            <span className="max-w-[180px] truncate text-xs font-semibold uppercase tracking-[0.1em] text-[#765943] xl:max-w-none xl:rotate-180 xl:[writing-mode:vertical-rl]">
+              {activePanelLabel}
+            </span>
+          </aside>
         ) : (
-        <aside className="order-3 flex flex-col gap-4 rounded-lg border border-[#d6bfa6] bg-[#fff8ef] p-4 shadow-[0_20px_44px_-30px_rgba(87,55,35,0.32)] lg:max-h-[calc(100dvh-2rem)] lg:overflow-auto">
+        <aside className="order-3 flex flex-col gap-4 rounded-lg border border-[#d6bfa6] bg-[#fff8ef] p-4 shadow-[0_20px_44px_-30px_rgba(87,55,35,0.32)] xl:max-h-[calc(100dvh-2rem)] xl:overflow-auto">
+          <div className="flex items-center justify-between gap-3 border-b border-[#e4d2bf] pb-3">
+            <span className="text-xs font-semibold uppercase tracking-[0.1em] text-[#765943]">
+              Inspector
+            </span>
+            <button
+              type="button"
+              aria-label="Collapse inspector"
+              title="Collapse panel"
+              className="flex h-9 w-9 items-center justify-center rounded-md border border-[#d8c4ad] bg-white text-[#654a38] transition hover:border-[#aa896c] active:translate-y-px"
+              onClick={() => setPanelCollapsed(true)}
+            >
+              <PanelRightClose size={17} strokeWidth={1.8} />
+            </button>
+          </div>
           <section>
             <div className="flex items-start justify-between gap-3">
               <div>

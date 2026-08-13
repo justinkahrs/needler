@@ -5,6 +5,8 @@ import {
   Check,
   Copy,
   Lock,
+  PanelRightClose,
+  PanelRightOpen,
   Pencil,
   RotateCcw,
   Save,
@@ -38,6 +40,9 @@ type Props = {
   onPreview: (assignments: Record<string, string> | null) => void;
   onCommit: (project: Project, message: string) => void;
   onClose: () => void;
+  onCollapse?: () => void;
+  onExpand?: () => void;
+  collapsed?: boolean;
 };
 
 const PROFILE_SWATCHES: Record<string, string[]> = {
@@ -88,6 +93,9 @@ export default function ColorwayStudio({
   onPreview,
   onCommit,
   onClose,
+  onCollapse,
+  onExpand,
+  collapsed,
 }: Props) {
   const usedRoles = useMemo(() => getUsedColorRoles(project), [project]);
   const [draft, setDraft] = useState(() => assignmentsForUsedRoles(project));
@@ -300,8 +308,27 @@ export default function ColorwayStudio({
     });
   };
 
+  if (collapsed) {
+    return (
+      <aside className="order-3 flex items-center justify-between gap-2 rounded-lg border border-[#d6bfa6] bg-[#fff8ef] p-2 shadow-[0_20px_44px_-30px_rgba(87,55,35,0.32)] xl:min-h-[calc(100dvh-2rem)] xl:flex-col xl:justify-start xl:px-1">
+        <button
+          type="button"
+          aria-label="Show Colorway Studio"
+          title="Show Colorway Studio"
+          className="flex h-11 w-11 shrink-0 items-center justify-center rounded-md border border-[#7e4e36] bg-[#7e4e36] text-[#fff9f0] transition active:translate-y-px"
+          onClick={onExpand}
+        >
+          <PanelRightOpen size={18} strokeWidth={1.8} />
+        </button>
+        <span className="max-w-[180px] truncate text-xs font-semibold uppercase tracking-[0.1em] text-[#765943] xl:max-w-none xl:rotate-180 xl:[writing-mode:vertical-rl]">
+          Colorways
+        </span>
+      </aside>
+    );
+  }
+
   return (
-    <aside className="order-3 flex flex-col rounded-lg border border-[#d6bfa6] bg-[#fff8ef] shadow-[0_20px_44px_-30px_rgba(87,55,35,0.32)] lg:max-h-[calc(100dvh-2rem)]">
+    <aside className="order-3 flex flex-col rounded-lg border border-[#d6bfa6] bg-[#fff8ef] shadow-[0_20px_44px_-30px_rgba(87,55,35,0.32)] xl:max-h-[calc(100dvh-2rem)]">
       <header className="flex items-center gap-3 border-b border-[#e4d2bf] p-4">
         <button
           type="button"
@@ -320,6 +347,17 @@ export default function ColorwayStudio({
             {usedRoles.length} used thread roles
           </p>
         </div>
+        {onCollapse ? (
+          <button
+            type="button"
+            aria-label="Collapse Colorway Studio"
+            title="Collapse panel"
+            className="ml-auto flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-[#d8c4ad] bg-white text-[#654a38] transition hover:border-[#aa896c] active:translate-y-px"
+            onClick={onCollapse}
+          >
+            <PanelRightClose size={17} strokeWidth={1.8} />
+          </button>
+        ) : null}
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto p-4">
